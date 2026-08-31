@@ -1,0 +1,27 @@
+[project]
+name = "site-optimizer-exercise"
+version = "0.1.0"
+description = "Data Scientist exercise: forecast a site and dispatch its battery"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "cvxpy>=1.5",
+    "highspy>=1.7",       # MILP solver reachable from cvxpy as solver="HIGHS"
+    "scikit-learn>=1.4",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+# You are free to add dependencies. Anything that `pip install`s is fine
+# (lightgbm, statsmodels, prophet, pyomo, a different solver, ...).
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pipeline"]
