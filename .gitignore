@@ -1,6 +1,4 @@
-data/
 models/
-site.yaml
 *.egg-info/
 *__pycache__*
 out/

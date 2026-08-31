@@ -1,0 +1,23 @@
+# Frozen site specification. Do not edit: we will run your pipeline with this file.
+site_name: "Site A"
+country_code: "BE"
+timezone: "Europe/Brussels"
+
+# Grid connection
+offtake_limit_kw: 100.0        # contractual maximum import
+injection_limit_kw: 150.0      # contractual maximum export
+
+# Capacity (peak) charge, billed on the highest quarter-hourly offtake of the CALENDAR MONTH
+offtake_monthly_peak_cost_eur_per_kw: 4.25
+
+battery:
+  capacity_kwh: 430.0
+  charge_power_kw: 200.0
+  discharge_power_kw: 200.0
+  min_soc: 0.05
+  max_soc: 0.95
+  round_trip_efficiency: 0.9
+  n_cycles_per_year: 400        # warranty envelope
+  capex_eur_per_kwh: 150.0
+  years_on_warranty: 10
+  initial_soc: 0.50             # SoC assumed at the start of a run
