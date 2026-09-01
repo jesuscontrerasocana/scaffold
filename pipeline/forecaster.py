@@ -384,8 +384,8 @@ class RidgeNetLoadModel:
 
     @classmethod
     def _calendar(cls, index: pd.DatetimeIndex) -> pd.DataFrame:
-        slot = index.hour * 4 + index.minute // 15
-        angle = 2 * np.pi * slot / 96
+        raw = build_calendar_features(index, ("time_of_day", "day_of_week"))
+        angle = 2 * np.pi * raw["time_of_day"] / 96
         result = pd.DataFrame(
             {
                 "time_of_day_sin": np.sin(angle),
@@ -394,7 +394,7 @@ class RidgeNetLoadModel:
             index=index,
         )
         for day in range(7):
-            result[f"dow_{day}"] = (index.dayofweek == day).astype(float)
+            result[f"dow_{day}"] = (raw["day_of_week"] == day).astype(float)
         return result
 
     @classmethod
@@ -409,11 +409,13 @@ class RidgeNetLoadModel:
 
         features = pd.DataFrame(index=targets)
         numeric_net = pd.to_numeric(net, errors="coerce")
+        lag_features = build_lag_features(numeric_net, targets, cls.LAGS)
         for lag in cls.LAGS:
             source = targets - lag
-            values = numeric_net.reindex(source).to_numpy(dtype=float, copy=True)
+            column = f"lag_{_offset_label(lag)}"
+            values = lag_features[column].to_numpy(dtype=float, copy=True)
             values[source >= decisions] = np.nan
-            features[f"lag_{_offset_label(lag)}"] = values
+            features[column] = values
 
         rolling = build_rolling_features(numeric_net, targets, cls.WINDOWS)
         for window in cls.WINDOWS:
@@ -539,18 +541,12 @@ class RidgeNetLoadModel:
     ) -> pd.DataFrame:
         """Build one row from actual history plus earlier recursive predictions."""
 
-        row: dict[str, float] = {}
-        for lag in cls.LAGS:
-            row[f"lag_{_offset_label(lag)}"] = net.get(target - lag, np.nan)
-        for window in cls.WINDOWS:
-            steps = int(window / STEP)
-            window_index = pd.date_range(end=target - STEP, periods=steps, freq=STEP)
-            values = net.reindex(window_index)
-            row[f"rolling_mean_{_offset_label(window)}"] = (
-                float(values.mean()) if values.notna().all() else np.nan
-            )
-        row[cls.EXOG_FEATURE] = exog_value
-        return pd.DataFrame(row, index=pd.DatetimeIndex([target]))
+        index = pd.DatetimeIndex([target])
+        features = build_lag_features(net, index, cls.LAGS).join(
+            build_rolling_features(net, index, cls.WINDOWS)
+        )
+        features[cls.EXOG_FEATURE] = exog_value
+        return features
 
     def state(self) -> dict[str, object]:
         return {
