@@ -55,6 +55,8 @@ def collect_forecasts(
 
     rows: list[pd.DataFrame] = []
     for at_time in decision_times(data.index, config):
+        if at_time.hour == 0 and at_time.minute == 0:
+            print(at_time)
         history = data.loc[data.index < at_time]
         horizon_index = pd.date_range(
             at_time, periods=config.horizon_steps, freq=STEP, tz=data.index.tz
