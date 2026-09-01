@@ -55,6 +55,9 @@ from pipeline.specs import SiteSpecs
 
 LOGGER = logging.getLogger(__name__)
 
+# This is the one place that controls the model used by the standard training command.
+SELECTED_MODEL = "weekly"
+
 
 def validate_and_clean_history(
     history: pd.DataFrame,
@@ -203,7 +206,7 @@ class Forecaster:
     SCAFFOLD = "scaffold"
     WEEKLY = "weekly"
 
-    def __init__(self, specs: SiteSpecs, model_name: str = SCAFFOLD) -> None:
+    def __init__(self, specs: SiteSpecs, model_name: str = SELECTED_MODEL) -> None:
         self.specs = specs
         self.model_name = model_name
         self.model = self._make_model(model_name)

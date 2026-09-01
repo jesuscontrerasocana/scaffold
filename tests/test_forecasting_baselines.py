@@ -31,16 +31,22 @@ def _history() -> pd.DataFrame:
 
 
 def _predict(
-    forecaster: Forecaster, history: pd.DataFrame, at_time: pd.Timestamp
+    forecaster: Forecaster,
+    history: pd.DataFrame,
+    at_time: pd.Timestamp,
+    horizon: int = 2,
 ) -> pd.DataFrame:
-    index = pd.date_range(at_time, periods=2, freq="15min")
+    index = pd.date_range(at_time, periods=horizon, freq="15min")
     return forecaster.predict(
-        at_time, history.loc[history.index < at_time], pd.DataFrame(index=index), 2
+        at_time,
+        history.loc[history.index < at_time],
+        pd.DataFrame(index=index),
+        horizon,
     )
 
 
-def test_scaffold_model_keeps_yesterday_then_last_week_behavior(
-    specs: SiteSpecs,
+def test_scaffold_model_keeps_all_fallback_stages_after_save_and_load(
+    specs: SiteSpecs, tmp_path
 ) -> None:
     history = _history()
     at_time = history.index[-1] + pd.Timedelta(minutes=15)
@@ -51,10 +57,28 @@ def test_scaffold_model_keeps_yesterday_then_last_week_behavior(
     history.loc[
         at_time - pd.Timedelta(days=7) + pd.Timedelta(minutes=15), "grid_net_kw"
     ] = 456.0
+    history.loc[
+        at_time - pd.Timedelta(days=1) + pd.Timedelta(minutes=30), "grid_net_kw"
+    ] = np.nan
+    history.loc[
+        at_time - pd.Timedelta(days=7) + pd.Timedelta(minutes=30), "grid_net_kw"
+    ] = np.nan
     forecaster = Forecaster(specs, model_name=Forecaster.SCAFFOLD)
     forecaster.fit(history)
+    expected = [123.0, 456.0, forecaster.fallback_kw]
 
-    assert _predict(forecaster, history, at_time)["net_kw"].tolist() == [123.0, 456.0]
+    assert _predict(forecaster, history, at_time, horizon=3)["net_kw"].tolist() == expected
+
+    forecaster.save(tmp_path)
+    loaded = Forecaster.load(tmp_path, specs)
+
+    assert _predict(loaded, history, at_time, horizon=3)["net_kw"].tolist() == expected
+
+
+def test_standard_training_selects_weekly_model(specs: SiteSpecs) -> None:
+    forecaster = Forecaster(specs)
+
+    assert forecaster.model_name == Forecaster.WEEKLY
 
 
 def test_weekly_model_uses_previous_week(specs: SiteSpecs) -> None:
