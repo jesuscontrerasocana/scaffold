@@ -52,11 +52,6 @@ import pandas as pd
 from pipeline.data import REQUIRED_COLUMNS, STEP
 from pipeline.specs import SiteSpecs
 
-HOURS_IN_DAY = 24
-TIME_STEPS_IN_HOUR = 4
-MINUTES_IN_HOUR = 60
-DAYS_IN_WEEK = 7
-
 LOGGER = logging.getLogger(__name__)
 
 # This is the one place that controls the model used by the standard training command.
@@ -227,10 +222,10 @@ class WeeklySeasonalBaseline:
 
     @staticmethod
     def _slots(index: pd.DatetimeIndex) -> np.ndarray:
-        return index.dayofweek * HOURS_IN_DAY * TIME_STEPS_IN_HOUR + index.hour * TIME_STEPS_IN_HOUR + index.minute // (MINUTES_IN_HOUR / TIME_STEPS_IN_HOUR)
+        return index.dayofweek * 96 + index.hour * 4 + index.minute // 15
 
     def _validate_time_of_week_medians(self):
-        expected_slots = set(range(DAYS_IN_WEEK * HOURS_IN_DAY * TIME_STEPS_IN_HOUR))
+        expected_slots = set(range(7 * 24 * 4))
 
         if set(self.time_of_week_medians) != expected_slots:
             missing = sorted(expected_slots - set(self.time_of_week_medians))
