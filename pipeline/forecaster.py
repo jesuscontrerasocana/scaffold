@@ -110,14 +110,115 @@ def validate_and_clean_history(
     return cleaned, summary
 
 
+def _usable_median(values: pd.Series) -> float:
+    finite = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    median = finite.median()
+    if pd.isna(median):
+        raise ValueError("History has no usable grid load observations")
+    return float(median)
+
+
+class ScaffoldBaseline:
+    """The original yesterday/last-week persistence baseline."""
+
+    def __init__(self) -> None:
+        self.fallback_kw = 0.0
+
+    def fit(self, history: pd.DataFrame) -> None:
+        self.fallback_kw = _usable_median(history["grid_net_kw"])
+
+    def predict(self, history: pd.DataFrame, index: pd.DatetimeIndex) -> pd.Series:
+        net = history["grid_net_kw"]
+        yesterday = net.reindex(index - pd.Timedelta(days=1))
+        last_week = net.reindex(index - pd.Timedelta(days=7))
+        values = pd.Series(yesterday.to_numpy(), index=index).fillna(
+            pd.Series(last_week.to_numpy(), index=index)
+        )
+        return values.fillna(self.fallback_kw)
+
+    def state(self) -> dict[str, object]:
+        return {"fallback_kw": self.fallback_kw}
+
+    def load_state(self, state: dict[str, object]) -> None:
+        self.fallback_kw = float(state["fallback_kw"])
+
+
+class WeeklySeasonalBaseline:
+    """Previous-week persistence with a historical time-of-week fallback."""
+
+    def __init__(self) -> None:
+        self.fallback_kw = 0.0
+        self.time_of_week_medians: dict[int, float] = {}
+
+    @staticmethod
+    def _slots(index: pd.DatetimeIndex) -> np.ndarray:
+        return index.dayofweek * 96 + index.hour * 4 + index.minute // 15
+
+    def fit(self, history: pd.DataFrame) -> None:
+        net = pd.to_numeric(history["grid_net_kw"], errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        )
+        self.fallback_kw = _usable_median(net)
+        by_slot = net.groupby(self._slots(history.index)).median().dropna()
+        self.time_of_week_medians = {
+            int(slot): float(value) for slot, value in by_slot.items()
+        }
+
+    def predict(self, history: pd.DataFrame, index: pd.DatetimeIndex) -> pd.Series:
+        weekly = pd.to_numeric(
+            history["grid_net_kw"].reindex(index - pd.Timedelta(days=7)),
+            errors="coerce",
+        ).replace([np.inf, -np.inf], np.nan)
+        weekly.index = index
+        fallback = pd.Series(
+            [
+                self.time_of_week_medians.get(int(slot), self.fallback_kw)
+                for slot in self._slots(index)
+            ],
+            index=index,
+        )
+        return weekly.fillna(fallback)
+
+    def state(self) -> dict[str, object]:
+        return {
+            "fallback_kw": self.fallback_kw,
+            "time_of_week_medians": self.time_of_week_medians,
+        }
+
+    def load_state(self, state: dict[str, object]) -> None:
+        self.fallback_kw = float(state["fallback_kw"])
+        medians = state["time_of_week_medians"]
+        if not isinstance(medians, dict):
+            raise ValueError("Invalid time-of-week median state")
+        self.time_of_week_medians = {
+            int(slot): float(value) for slot, value in medians.items()
+        }
+
+
 class Forecaster:
-    """BASELINE — replace me. Persistence: what happened at this time yesterday."""
+    """Harness-facing wrapper for the selected forecasting baseline."""
 
     PARAMS = "forecaster.json"
 
-    def __init__(self, specs: SiteSpecs) -> None:
+    SCAFFOLD = "scaffold"
+    WEEKLY = "weekly"
+
+    def __init__(self, specs: SiteSpecs, model_name: str = SCAFFOLD) -> None:
         self.specs = specs
-        self.fallback_kw = 0.0
+        self.model_name = model_name
+        self.model = self._make_model(model_name)
+
+    @staticmethod
+    def _make_model(model_name: str) -> ScaffoldBaseline | WeeklySeasonalBaseline:
+        if model_name == Forecaster.SCAFFOLD:
+            return ScaffoldBaseline()
+        if model_name == Forecaster.WEEKLY:
+            return WeeklySeasonalBaseline()
+        raise ValueError(f"Unknown forecasting model: {model_name}")
+
+    @property
+    def fallback_kw(self) -> float:
+        return self.model.fallback_kw
 
     def fit(self, history: pd.DataFrame) -> None:
         cleaned, summary = validate_and_clean_history(history)
@@ -128,22 +229,18 @@ class Forecaster:
             summary["end"],
             summary["missing_by_column"],
         )
-        fallback = cleaned["grid_net_kw"].median()
-        if pd.isna(fallback):
-            raise ValueError("History has no usable grid load observations")
-        self.fallback_kw = float(fallback)
+        self.model.fit(cleaned)
 
     def save(self, path: Path) -> None:
         (Path(path) / self.PARAMS).write_text(
-            json.dumps({"fallback_kw": self.fallback_kw})
+            json.dumps({"model_name": self.model_name, "state": self.model.state()})
         )
 
     @classmethod
     def load(cls, path: Path, specs: SiteSpecs) -> "Forecaster":
-        self = cls(specs)
-        self.fallback_kw = json.loads((Path(path) / cls.PARAMS).read_text())[
-            "fallback_kw"
-        ]
+        params = json.loads((Path(path) / cls.PARAMS).read_text())
+        self = cls(specs, model_name=params["model_name"])
+        self.model.load_state(params["state"])
         return self
 
     def predict(
@@ -154,11 +251,5 @@ class Forecaster:
         horizon: int,
     ) -> pd.DataFrame:
         index = future_exog.index[:horizon]
-        net = history["grid_net_kw"]
-        yesterday = net.reindex(index - pd.Timedelta(days=1))
-        last_week = net.reindex(index - pd.Timedelta(days=7))
-        values = yesterday.to_numpy()
-        values = pd.Series(values, index=index).fillna(
-            pd.Series(last_week.to_numpy(), index=index)
-        )
-        return pd.DataFrame({"net_kw": values.fillna(self.fallback_kw)}, index=index)
+        values = self.model.predict(history, index)
+        return pd.DataFrame({"net_kw": values}, index=index)
