@@ -60,7 +60,7 @@ DAYS_IN_WEEK = 7
 LOGGER = logging.getLogger(__name__)
 
 # This is the one place that controls the model used by the standard training command.
-SELECTED_MODEL = "weekly"   # weekly or scaffold
+SELECTED_MODEL = "scaffold"   # weekly or scaffold
 
 
 def validate_and_clean_history(

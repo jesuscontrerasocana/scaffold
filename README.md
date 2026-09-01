@@ -54,6 +54,47 @@ electricity is cheap, straight through the site's busiest hours, and pushes the 
 far above where it would have been with no battery at all. Its capacity charge alone more
 than eats every euro it earns from arbitrage.
 
+### Evaluate forecast accuracy only
+
+After training a model, evaluate its forecasts without running the optimizer, battery
+simulation, billing, or reporting pipeline:
+
+```bash
+uv run python scripts/evaluate_forecast.py \
+    --data data/history.csv \
+    --model-dir models/ \
+    --from 2026-06-01 \
+    --to 2026-06-30
+```
+
+The model type comes from the persisted model in `--model-dir`, so the same command works
+for scaffold and weekly models. The script rolls through the requested decision times with
+the same 33-hour forecast horizon and information boundary as the normal harness. Forecasts
+may extend beyond `--to` when later realized data is available.
+
+It prints overall MAE, RMSE, mean error (bias), and nMAE. By default, it writes two files
+beside the persisted model:
+
+| file | contents |
+|---|---|
+| `<model-dir>/forecast_lead_metrics.csv` | MAE, RMSE, and bias for each forecast lead step |
+| `<model-dir>/forecast_comparisons.csv` | every forecast and actual value side by side, with its decision time, target time, and lead step |
+
+Use `--out` to choose another path for the lead-metrics CSV; the comparisons CSV is written
+beside it. Use `--horizon-steps` or `--decision-interval-minutes` for a smaller diagnostic
+run:
+
+```bash
+uv run python scripts/evaluate_forecast.py \
+    --data data/history.csv \
+    --model-dir models/ \
+    --from 2026-06-01 \
+    --to 2026-06-02 \
+    --horizon-steps 32 \
+    --decision-interval-minutes 60 \
+    --out out/june_forecast_metrics.csv
+```
+
 ## 3. How the site works
 
 If you have not worked on an energy system before, this is everything you need. If you have,
