@@ -5,7 +5,12 @@ import pandas as pd
 import pytest
 
 from pipeline.harness import RunConfig
-from scripts.evaluate_forecast import calculate_metrics, collect_forecasts, lead_metrics
+from scripts.evaluate_forecast import (
+    calculate_metrics,
+    collect_forecasts,
+    component_metrics,
+    lead_metrics,
+)
 
 
 def test_metric_calculation_and_lead_grouping() -> None:
@@ -27,8 +32,20 @@ def test_metric_calculation_and_lead_grouping() -> None:
         "nmae": 0.5,
     }
     assert per_lead.to_dict("records") == [
-        {"lead_steps": 1, "mae_kw": 1.5, "rmse_kw": np.sqrt(2.5), "bias_kw": 1.5},
-        {"lead_steps": 2, "mae_kw": 1.0, "rmse_kw": 1.0, "bias_kw": -1.0},
+        {
+            "component": "net",
+            "lead_step": 1,
+            "mae_kw": 1.5,
+            "rmse_kw": np.sqrt(2.5),
+            "bias_kw": 1.5,
+        },
+        {
+            "component": "net",
+            "lead_step": 2,
+            "mae_kw": 1.0,
+            "rmse_kw": 1.0,
+            "bias_kw": -1.0,
+        },
     ]
 
 
@@ -71,6 +88,8 @@ def test_rolling_forecast_alignment_and_information_boundary() -> None:
     assert comparisons["lead_steps"].tolist() == [1, 2, 3]
     assert comparisons["actual_kw"].tolist() == [2.0, 3.0, 4.0]
     assert comparisons["predicted_kw"].tolist() == [2.0, 3.0, 4.0]
+    assert "forecast_load_kw" not in comparisons
+    assert "forecast_pv_kw" not in comparisons
 
 
 def test_component_forecasts_are_included_in_comparisons() -> None:
@@ -99,7 +118,47 @@ def test_component_forecasts_are_included_in_comparisons() -> None:
         RunConfig(first_decision=index[2], last_decision=index[2], horizon_steps=3),
     )
 
-    assert comparisons["predicted_load_kw"].tolist() == [7.0, 7.0, 7.0]
-    assert comparisons["predicted_pv_kw"].tolist() == [3.0, 3.0, 3.0]
+    assert comparisons["forecast_load_kw"].tolist() == [7.0, 7.0, 7.0]
+    assert comparisons["forecast_pv_kw"].tolist() == [3.0, 3.0, 3.0]
     assert comparisons["actual_load_kw"].tolist() == [10.0, 12.0, 14.0]
     assert comparisons["actual_pv_kw"].tolist() == [3.0, 4.0, 5.0]
+    assert comparisons["load_error_kw"].tolist() == [-3.0, -5.0, -7.0]
+    assert comparisons["pv_error_kw"].tolist() == [0.0, -1.0, -2.0]
+
+    metrics = component_metrics(comparisons)
+    per_lead = lead_metrics(comparisons)
+    assert list(metrics) == ["net", "load", "pv"]
+    assert set(per_lead["component"]) == {"net", "load", "pv"}
+
+
+def test_missing_actual_pv_is_excluded_from_component_metrics() -> None:
+    comparisons = pd.DataFrame(
+        {
+            "lead_steps": [1, 1, 2],
+            "actual_kw": [1.0, 2.0, 3.0],
+            "predicted_kw": [2.0, 3.0, 4.0],
+            "actual_load_kw": [5.0, np.nan, 7.0],
+            "forecast_load_kw": [6.0, 100.0, 8.0],
+            "actual_pv_kw": [4.0, np.nan, 4.0],
+            "forecast_pv_kw": [4.0, 100.0, 5.0],
+        }
+    )
+
+    metrics = component_metrics(comparisons)
+    per_lead = lead_metrics(comparisons)
+
+    assert metrics["net"]["mae_kw"] == 1.0
+    assert metrics["load"]["mae_kw"] == 1.0
+    assert metrics["pv"]["mae_kw"] == 0.5
+    assert len(per_lead[per_lead["component"] == "net"]) == 2
+    assert len(per_lead[per_lead["component"] == "load"]) == 2
+    assert len(per_lead[per_lead["component"] == "pv"]) == 2
+
+
+def test_net_only_comparisons_do_not_gain_component_columns() -> None:
+    comparisons = pd.DataFrame(
+        {"lead_steps": [1], "actual_kw": [1.0], "predicted_kw": [2.0]}
+    )
+
+    assert list(component_metrics(comparisons)) == ["net"]
+    assert lead_metrics(comparisons)["component"].tolist() == ["net"]

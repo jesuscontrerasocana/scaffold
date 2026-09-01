@@ -13,3 +13,4 @@
 - Remove unconditional progress output from forecast evaluation.
 - Add a direct decomposed Ridge model that forecasts site load and non-negative PV separately.
 - Expose decomposed load/PV forecasts in model output and forecast comparisons.
+- Evaluate available net, load, and PV forecasts with aggregate and per-lead metrics.
