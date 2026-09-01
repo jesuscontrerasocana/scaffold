@@ -60,7 +60,7 @@ DAYS_IN_WEEK = 7
 LOGGER = logging.getLogger(__name__)
 
 # This is the one place that controls the model used by the standard training command.
-SELECTED_MODEL = "scaffold"   # weekly or scaffold
+SELECTED_MODEL = "weekly"   # weekly or scaffold
 
 
 def validate_and_clean_history(
@@ -161,6 +161,18 @@ class WeeklySeasonalBaseline:
     def _slots(index: pd.DatetimeIndex) -> np.ndarray:
         return index.dayofweek * HOURS_IN_DAY * TIME_STEPS_IN_HOUR + index.hour * TIME_STEPS_IN_HOUR + index.minute // (MINUTES_IN_HOUR / TIME_STEPS_IN_HOUR)
 
+    def _validate_time_of_week_medians(self):
+        expected_slots = set(range(DAYS_IN_WEEK * HOURS_IN_DAY * TIME_STEPS_IN_HOUR))
+
+        if set(self.time_of_week_medians) != expected_slots:
+            missing = sorted(expected_slots - set(self.time_of_week_medians))
+            raise ValueError(
+                f"Missing time-of-week medians for slots: {missing}"
+            )
+
+        if not all(np.isfinite(value) for value in self.time_of_week_medians.values()):
+            raise ValueError("Time-of-week medians contain invalid values")
+
     def fit(self, history: pd.DataFrame) -> None:
         net = pd.to_numeric(history["grid_net_kw"], errors="coerce").replace(
             [np.inf, -np.inf], np.nan
@@ -169,6 +181,8 @@ class WeeklySeasonalBaseline:
         self.time_of_week_medians = {
             int(slot): float(value) for slot, value in by_slot.items()
         }
+
+        self._validate_time_of_week_medians()
 
     def predict(self, history: pd.DataFrame, index: pd.DatetimeIndex) -> pd.Series:
         weekly = pd.to_numeric(
@@ -184,17 +198,6 @@ class WeeklySeasonalBaseline:
             index=index,
         )
 
-        expected_slots = set(range(DAYS_IN_WEEK * HOURS_IN_DAY * TIME_STEPS_IN_HOUR))
-
-        if set(self.time_of_week_medians) != expected_slots:
-            missing = sorted(expected_slots - set(self.time_of_week_medians))
-            raise ValueError(
-                f"Missing time-of-week medians for slots: {missing}"
-            )
-
-        if not all(np.isfinite(value) for value in self.time_of_week_medians.values()):
-            raise ValueError("Time-of-week medians contain invalid values")
-
         return weekly.fillna(fallback)
 
     def state(self) -> dict[str, object]:
@@ -209,6 +212,7 @@ class WeeklySeasonalBaseline:
         self.time_of_week_medians = {
             int(slot): float(value) for slot, value in medians.items()
         }
+        self._validate_time_of_week_medians()
 
 
 class Forecaster:
