@@ -432,21 +432,22 @@ class RidgeNetLoadModel:
 
     def fit(self, history: pd.DataFrame) -> None:
         targets = history.index
-        # Cycle through the operational lead times so training rows reproduce the
-        # same information boundaries as forecasts without expanding data 132-fold.
-        leads = np.arange(len(targets)) % self.MAX_HORIZON + 1
-        decisions = targets - (leads - 1) * STEP
         continuous = self._continuous_features(
             history["grid_net_kw"],
             history[self.EXOG_FEATURE],
             targets,
-            decisions,
+            targets,
         )
         target = pd.to_numeric(history["grid_net_kw"], errors="coerce")
-        usable_target = target.notna() & np.isfinite(target)
-        dropped = int((~usable_target).sum())
-        continuous = continuous.loc[usable_target]
-        target = target.loc[usable_target]
+        usable = (
+            target.notna()
+            & np.isfinite(target)
+            & continuous.notna().all(axis=1)
+            & np.isfinite(continuous).all(axis=1)
+        )
+        dropped = int((~usable).sum())
+        continuous = continuous.loc[usable]
+        target = target.loc[usable]
         calendar = self._calendar(continuous.index)
 
         self.fill_values = {
@@ -508,22 +509,48 @@ class RidgeNetLoadModel:
         index: pd.DatetimeIndex,
         at_time: pd.Timestamp,
     ) -> pd.Series:
-        decisions = pd.DatetimeIndex([at_time] * len(index))
-        continuous = self._continuous_features(
-            history["grid_net_kw"],
-            future_exog[self.EXOG_FEATURE],
-            index,
-            decisions,
-        )
-        scaled = self.scaler.transform(self._fill_continuous(continuous))
         positions = [
             self.CONTINUOUS_COLUMNS.index(name)
             for name in self.selected_continuous_features
         ]
-        design = np.column_stack(
-            [self._calendar(index).loc[:, self.CALENDAR_COLUMNS], scaled[:, positions]]
-        )
-        return pd.Series(self.regressor.predict(design), index=index)
+        working_net = pd.to_numeric(
+            history.loc[history.index < at_time, "grid_net_kw"], errors="coerce"
+        ).copy()
+        predictions = []
+        for target_time in index:
+            continuous = self._recursive_features(
+                working_net,
+                future_exog.at[target_time, self.EXOG_FEATURE],
+                target_time,
+            )
+            scaled = self.scaler.transform(self._fill_continuous(continuous))
+            calendar = self._calendar(pd.DatetimeIndex([target_time]))
+            design = np.column_stack(
+                [calendar.loc[:, self.CALENDAR_COLUMNS], scaled[:, positions]]
+            )
+            prediction = float(self.regressor.predict(design)[0])
+            predictions.append(prediction)
+            working_net.loc[target_time] = prediction
+        return pd.Series(predictions, index=index)
+
+    @classmethod
+    def _recursive_features(
+        cls, net: pd.Series, exog_value: float, target: pd.Timestamp
+    ) -> pd.DataFrame:
+        """Build one row from actual history plus earlier recursive predictions."""
+
+        row: dict[str, float] = {}
+        for lag in cls.LAGS:
+            row[f"lag_{_offset_label(lag)}"] = net.get(target - lag, np.nan)
+        for window in cls.WINDOWS:
+            steps = int(window / STEP)
+            window_index = pd.date_range(end=target - STEP, periods=steps, freq=STEP)
+            values = net.reindex(window_index)
+            row[f"rolling_mean_{_offset_label(window)}"] = (
+                float(values.mean()) if values.notna().all() else np.nan
+            )
+        row[cls.EXOG_FEATURE] = exog_value
+        return pd.DataFrame(row, index=pd.DatetimeIndex([target]))
 
     def state(self) -> dict[str, object]:
         return {

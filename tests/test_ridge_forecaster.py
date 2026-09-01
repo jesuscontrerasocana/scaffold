@@ -57,7 +57,8 @@ def test_ridge_trains_predicts_and_exposes_summary(specs: SiteSpecs) -> None:
     assert np.isfinite(prediction["net_kw"]).all()
     assert summary["selected_features"] == forecaster.model.feature_names
     assert set(summary["coefficients"]) == set(forecaster.model.feature_names)
-    assert summary["training_samples"] == len(history)
+    assert summary["training_samples"] + summary["dropped_rows"] == len(history)
+    assert summary["dropped_rows"] > 0
     assert summary["train_mae"] >= 0
     assert summary["validation_rmse"] >= 0
 
@@ -85,7 +86,7 @@ def test_ridge_save_load_preserves_features_and_predictions(
 
 
 def test_long_horizon_does_not_use_realized_values_after_decision(
-    specs: SiteSpecs,
+    specs: SiteSpecs, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data = _data()
     forecaster = Forecaster(specs, model_name=Forecaster.RIDGE)
@@ -99,8 +100,20 @@ def test_long_horizon_does_not_use_realized_values_after_decision(
         {"most_recent_load_factor_forecast": data.loc[index, "most_recent_load_factor_forecast"]},
         index=index,
     )
+    original = RidgeNetLoadModel._recursive_features.__func__
+    saw_previous_step: list[bool] = []
+
+    def recording_features(cls, net, exog_value, target):  # noqa: ANN001
+        if target > at_time:
+            saw_previous_step.append(target - pd.Timedelta(minutes=15) in net.index)
+        return original(cls, net, exog_value, target)
+
+    monkeypatch.setattr(
+        RidgeNetLoadModel, "_recursive_features", classmethod(recording_features)
+    )
 
     safe = forecaster.predict(at_time, safe_history, future_exog, 132)
     leaked = forecaster.predict(at_time, leaked_history, future_exog, 132)
 
     pd.testing.assert_frame_equal(safe, leaked)
+    assert saw_previous_step and all(saw_previous_step)
