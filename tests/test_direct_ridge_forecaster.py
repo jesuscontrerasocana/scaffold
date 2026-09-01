@@ -78,14 +78,15 @@ def test_prediction_is_direct_and_ignores_future_actuals(specs: SiteSpecs) -> No
 
 
 def test_features_use_decision_history_and_target_time() -> None:
-    data = _data(days=2)
-    decisions = data.index[20:22]
+    data = _data()
+    decisions = data.index[7 * 96 + 20 : 7 * 96 + 22]
     decision_features = DirectRidgeNetLoadModel._decision_features(
         data["grid_net_kw"], decisions
     )
     lead = 5
     features = DirectRidgeNetLoadModel._features_for_lead(
         decision_features,
+        data["grid_net_kw"],
         data["most_recent_load_factor_forecast"],
         lead,
     )
@@ -100,10 +101,25 @@ def test_features_use_decision_history_and_target_time() -> None:
     assert features.iloc[0]["most_recent_load_factor_forecast"] == data.at[
         target_times[0], "most_recent_load_factor_forecast"
     ]
+    assert features.iloc[0]["target_minus_1day"] == data.at[
+        target_times[0] - pd.Timedelta(days=1), "grid_net_kw"
+    ]
     expected_slot = target_times[0].hour * 4 + target_times[0].minute // 15
     assert features.iloc[0]["time_of_day_sin"] == pytest.approx(
         np.sin(2 * np.pi * expected_slot / 96)
     )
+
+    long_lead = DirectRidgeNetLoadModel._features_for_lead(
+        decision_features,
+        data["grid_net_kw"],
+        data["most_recent_load_factor_forecast"],
+        100,
+    )
+    assert long_lead["target_minus_1day"].isna().all()
+    long_target = decisions[0] + 99 * pd.Timedelta(minutes=15)
+    assert long_lead.iloc[0]["target_minus_7day"] == data.at[
+        long_target - pd.Timedelta(days=7), "grid_net_kw"
+    ]
 
 
 def test_save_load_metadata_and_missing_fallback(
@@ -130,6 +146,8 @@ def test_save_load_metadata_and_missing_fallback(
     assert state["max_horizon"] == 132
     assert state["feature_names"] == list(DirectRidgeNetLoadModel.FEATURE_NAMES)
     assert len(state["lead_models"]) == 132
+    assert state["lead_models"][0]["lead_minutes"] == 0
+    assert state["lead_models"][-1]["lead_minutes"] == 131 * 15
     assert set(state["lead_models"][0]["coefficients"]) == set(
         DirectRidgeNetLoadModel.FEATURE_NAMES
     )

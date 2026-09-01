@@ -350,6 +350,8 @@ class DirectRidgeNetLoadModel:
         "lag_1h",
         "rolling_mean_1h",
         "rolling_mean_4h",
+        "target_minus_1day",
+        "target_minus_7day",
         "time_of_day_sin",
         "time_of_day_cos",
         "dow_0",
@@ -395,6 +397,7 @@ class DirectRidgeNetLoadModel:
     def _features_for_lead(
         cls,
         decision_features: pd.DataFrame,
+        net: pd.Series,
         exog: pd.Series,
         lead_steps: int,
     ) -> pd.DataFrame:
@@ -403,6 +406,18 @@ class DirectRidgeNetLoadModel:
         calendar = cls._target_calendar(target_times)
         calendar.index = decisions
         result = decision_features.join(calendar)
+        seasonal = build_lag_features(
+            net,
+            target_times,
+            (pd.Timedelta(days=1), pd.Timedelta(days=7)),
+        )
+        seasonal.index = decisions
+        result["target_minus_1day"] = seasonal["lag_1day"]
+        result.loc[
+            target_times - pd.Timedelta(days=1) >= decisions,
+            "target_minus_1day",
+        ] = np.nan
+        result["target_minus_7day"] = seasonal["lag_7day"]
         result[cls.EXOG_FEATURE] = pd.to_numeric(
             exog.reindex(target_times), errors="coerce"
         ).to_numpy(dtype=float)
@@ -415,6 +430,12 @@ class DirectRidgeNetLoadModel:
         decision_features = self._decision_features(net, decisions)
         calendar = self._target_calendar(decisions)
         fill_source = decision_features.join(calendar)
+        fill_source["target_minus_1day"] = net.reindex(
+            decisions - pd.Timedelta(days=1)
+        ).to_numpy(dtype=float)
+        fill_source["target_minus_7day"] = net.reindex(
+            decisions - pd.Timedelta(days=7)
+        ).to_numpy(dtype=float)
         fill_source[self.EXOG_FEATURE] = exog
         self.fill_values = {
             name: float(fill_source[name].median()) for name in self.FEATURE_NAMES
@@ -427,8 +448,11 @@ class DirectRidgeNetLoadModel:
         self.lead_summaries = []
         for lead_steps in range(1, self.MAX_HORIZON + 1):
             features = self._features_for_lead(
-                decision_features, exog, lead_steps
+                decision_features, net, exog, lead_steps
             )
+            features["target_minus_1day"] = features[
+                "target_minus_1day"
+            ].fillna(self.fill_values["target_minus_1day"])
             target_times = decisions + (lead_steps - 1) * STEP
             target = net.reindex(target_times)
             target.index = decisions
@@ -454,7 +478,7 @@ class DirectRidgeNetLoadModel:
             self.lead_summaries.append(
                 {
                     "lead_steps": lead_steps,
-                    "lead_minutes": lead_steps * 15,
+                    "lead_minutes": (lead_steps - 1) * 15,
                     "training_samples": len(training_target),
                     "dropped_rows": int((~usable).sum()),
                     "train_mae": float(mean_absolute_error(training_target, fitted)),
@@ -491,6 +515,17 @@ class DirectRidgeNetLoadModel:
         features = calendar.copy()
         for name in decision_features.columns:
             features[name] = historical[name]
+        seasonal = build_lag_features(
+            known_net,
+            index,
+            (pd.Timedelta(days=1), pd.Timedelta(days=7)),
+        )
+        features["target_minus_1day"] = seasonal["lag_1day"]
+        features.loc[
+            index - pd.Timedelta(days=1) >= at_time,
+            "target_minus_1day",
+        ] = np.nan
+        features["target_minus_7day"] = seasonal["lag_7day"]
         features[self.EXOG_FEATURE] = pd.to_numeric(
             future_exog[self.EXOG_FEATURE].reindex(index), errors="coerce"
         )
