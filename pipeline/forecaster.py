@@ -46,8 +46,12 @@ import json
 import logging
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import StandardScaler
 
 from pipeline.data import REQUIRED_COLUMNS, STEP
 from pipeline.specs import SiteSpecs
@@ -55,7 +59,7 @@ from pipeline.specs import SiteSpecs
 LOGGER = logging.getLogger(__name__)
 
 # This is the one place that controls the model used by the standard training command.
-SELECTED_MODEL = "scaffold"   # weekly or scaffold
+SELECTED_MODEL = "ridge"   # ridge, weekly, or scaffold
 
 CALENDAR_FEATURES = ("time_of_day", "day_of_week", "is_weekend", "month")
 
@@ -332,6 +336,256 @@ class WeeklySeasonalBaseline:
         self._validate_time_of_week_medians()
 
 
+class DirectRidgeNetLoadModel:
+    """One direct Ridge model per forecast lead time."""
+
+    ARTIFACT = "model.joblib"
+    ALPHA = 1.0
+    MAX_HORIZON = 132
+    EXOG_FEATURE = "most_recent_load_factor_forecast"
+    HISTORY_LAGS = (pd.Timedelta(minutes=15), pd.Timedelta(hours=1))
+    HISTORY_WINDOWS = (pd.Timedelta(hours=1), pd.Timedelta(hours=4))
+    FEATURE_NAMES = (
+        "lag_15min",
+        "lag_1h",
+        "rolling_mean_1h",
+        "rolling_mean_4h",
+        "target_minus_1day",
+        "target_minus_7day",
+        "time_of_day_sin",
+        "time_of_day_cos",
+        "dow_0",
+        "dow_1",
+        "dow_2",
+        "dow_3",
+        "dow_4",
+        "dow_5",
+        "dow_6",
+        EXOG_FEATURE,
+    )
+
+    def __init__(self) -> None:
+        self.scalers: list[StandardScaler] = []
+        self.models: list[Ridge] = []
+        self.fill_values: dict[str, float] = {}
+        self.lead_summaries: list[dict[str, object]] = []
+
+    @staticmethod
+    def _target_calendar(index: pd.DatetimeIndex) -> pd.DataFrame:
+        raw = build_calendar_features(index, ("time_of_day", "day_of_week"))
+        angle = 2 * np.pi * raw["time_of_day"] / 96
+        result = pd.DataFrame(
+            {
+                "time_of_day_sin": np.sin(angle),
+                "time_of_day_cos": np.cos(angle),
+            },
+            index=index,
+        )
+        for day in range(7):
+            result[f"dow_{day}"] = (raw["day_of_week"] == day).astype(float)
+        return result
+
+    @classmethod
+    def _decision_features(
+        cls, net: pd.Series, decisions: pd.DatetimeIndex
+    ) -> pd.DataFrame:
+        return build_lag_features(net, decisions, cls.HISTORY_LAGS).join(
+            build_rolling_features(net, decisions, cls.HISTORY_WINDOWS)
+        )
+
+    @classmethod
+    def _features_for_lead(
+        cls,
+        decision_features: pd.DataFrame,
+        net: pd.Series,
+        exog: pd.Series,
+        lead_steps: int,
+    ) -> pd.DataFrame:
+        decisions = decision_features.index
+        target_times = decisions + (lead_steps - 1) * STEP
+        calendar = cls._target_calendar(target_times)
+        calendar.index = decisions
+        result = decision_features.join(calendar)
+        seasonal = build_lag_features(
+            net,
+            target_times,
+            (pd.Timedelta(days=1), pd.Timedelta(days=7)),
+        )
+        seasonal.index = decisions
+        result["target_minus_1day"] = seasonal["lag_1day"]
+        result.loc[
+            target_times - pd.Timedelta(days=1) >= decisions,
+            "target_minus_1day",
+        ] = np.nan
+        result["target_minus_7day"] = seasonal["lag_7day"]
+        result[cls.EXOG_FEATURE] = pd.to_numeric(
+            exog.reindex(target_times), errors="coerce"
+        ).to_numpy(dtype=float)
+        return result.loc[:, cls.FEATURE_NAMES]
+
+    def fit(self, history: pd.DataFrame) -> None:
+        net = pd.to_numeric(history["grid_net_kw"], errors="coerce")
+        exog = pd.to_numeric(history[self.EXOG_FEATURE], errors="coerce")
+        decisions = history.index
+        decision_features = self._decision_features(net, decisions)
+        calendar = self._target_calendar(decisions)
+        fill_source = decision_features.join(calendar)
+        fill_source["target_minus_1day"] = net.reindex(
+            decisions - pd.Timedelta(days=1)
+        ).to_numpy(dtype=float)
+        fill_source["target_minus_7day"] = net.reindex(
+            decisions - pd.Timedelta(days=7)
+        ).to_numpy(dtype=float)
+        fill_source[self.EXOG_FEATURE] = exog
+        self.fill_values = {
+            name: float(fill_source[name].median()) for name in self.FEATURE_NAMES
+        }
+        if not all(np.isfinite(list(self.fill_values.values()))):
+            raise ValueError("Training history cannot populate all Ridge features")
+
+        self.scalers = []
+        self.models = []
+        self.lead_summaries = []
+        for lead_steps in range(1, self.MAX_HORIZON + 1):
+            features = self._features_for_lead(
+                decision_features, net, exog, lead_steps
+            )
+            features["target_minus_1day"] = features[
+                "target_minus_1day"
+            ].fillna(self.fill_values["target_minus_1day"])
+            target_times = decisions + (lead_steps - 1) * STEP
+            target = net.reindex(target_times)
+            target.index = decisions
+            usable = (
+                features.notna().all(axis=1)
+                & np.isfinite(features).all(axis=1)
+                & target.notna()
+                & np.isfinite(target)
+            )
+            training_features = features.loc[usable]
+            training_target = target.loc[usable]
+            if len(training_target) < 12:
+                raise ValueError(
+                    f"Ridge lead {lead_steps} requires at least 12 usable rows"
+                )
+
+            scaler = StandardScaler()
+            scaled = scaler.fit_transform(training_features)
+            model = Ridge(alpha=self.ALPHA).fit(scaled, training_target)
+            fitted = model.predict(scaled)
+            self.scalers.append(scaler)
+            self.models.append(model)
+            self.lead_summaries.append(
+                {
+                    "lead_steps": lead_steps,
+                    "lead_minutes": (lead_steps - 1) * 15,
+                    "training_samples": len(training_target),
+                    "dropped_rows": int((~usable).sum()),
+                    "train_mae": float(mean_absolute_error(training_target, fitted)),
+                    "train_rmse": float(
+                        mean_squared_error(training_target, fitted) ** 0.5
+                    ),
+                    "coefficients": {
+                        name: float(value)
+                        for name, value in zip(
+                            self.FEATURE_NAMES, model.coef_, strict=True
+                        )
+                    },
+                    "intercept": float(model.intercept_),
+                }
+            )
+
+    def predict(
+        self,
+        history: pd.DataFrame,
+        future_exog: pd.DataFrame,
+        index: pd.DatetimeIndex,
+        at_time: pd.Timestamp,
+    ) -> pd.Series:
+        if len(index) > self.MAX_HORIZON:
+            raise ValueError(f"Ridge horizon cannot exceed {self.MAX_HORIZON} steps")
+        known_net = pd.to_numeric(
+            history.loc[history.index < at_time, "grid_net_kw"], errors="coerce"
+        )
+        decision_features = self._decision_features(
+            known_net, pd.DatetimeIndex([at_time])
+        )
+        historical = decision_features.iloc[0]
+        calendar = self._target_calendar(index)
+        features = calendar.copy()
+        for name in decision_features.columns:
+            features[name] = historical[name]
+        seasonal = build_lag_features(
+            known_net,
+            index,
+            (pd.Timedelta(days=1), pd.Timedelta(days=7)),
+        )
+        features["target_minus_1day"] = seasonal["lag_1day"]
+        features.loc[
+            index - pd.Timedelta(days=1) >= at_time,
+            "target_minus_1day",
+        ] = np.nan
+        features["target_minus_7day"] = seasonal["lag_7day"]
+        features[self.EXOG_FEATURE] = pd.to_numeric(
+            future_exog[self.EXOG_FEATURE].reindex(index), errors="coerce"
+        )
+        features = features.loc[:, self.FEATURE_NAMES].fillna(self.fill_values)
+
+        scalers = self.scalers[: len(index)]
+        models = self.models[: len(index)]
+        values = features.to_numpy(dtype=float)
+        means = np.vstack([scaler.mean_ for scaler in scalers])
+        scales = np.vstack([scaler.scale_ for scaler in scalers])
+        coefficients = np.vstack([model.coef_ for model in models])
+        intercepts = np.asarray([model.intercept_ for model in models])
+        predictions = np.sum(
+            ((values - means) / scales) * coefficients, axis=1
+        ) + intercepts
+        return pd.Series(predictions, index=index)
+
+    def state(self) -> dict[str, object]:
+        return {
+            "max_horizon": self.MAX_HORIZON,
+            "feature_names": list(self.FEATURE_NAMES),
+            "alpha": self.ALPHA,
+            "fill_values": self.fill_values,
+            "lead_models": self.lead_summaries,
+            "coefficient_space": "standardized feature space",
+        }
+
+    def load_state(self, state: dict[str, object]) -> None:
+        if state["max_horizon"] != self.MAX_HORIZON:
+            raise ValueError("Ridge artifact has an incompatible forecast horizon")
+        if state["feature_names"] != list(self.FEATURE_NAMES):
+            raise ValueError("Ridge artifact has incompatible features")
+        self.fill_values = {
+            str(name): float(value) for name, value in state["fill_values"].items()
+        }
+        self.lead_summaries = list(state["lead_models"])
+
+    def summary(self) -> dict[str, object]:
+        samples = [int(item["training_samples"]) for item in self.lead_summaries]
+        return {
+            "model_count": len(self.models),
+            "feature_names": list(self.FEATURE_NAMES),
+            "alpha": self.ALPHA,
+            "training_samples_min": min(samples),
+            "training_samples_max": max(samples),
+            "lead_models": self.lead_summaries,
+        }
+
+    def save_artifact(self, path: Path) -> None:
+        joblib.dump(
+            {"scalers": self.scalers, "models": self.models},
+            Path(path) / self.ARTIFACT,
+        )
+
+    def load_artifact(self, path: Path) -> None:
+        artifact = joblib.load(Path(path) / self.ARTIFACT)
+        self.scalers = artifact["scalers"]
+        self.models = artifact["models"]
+
+
 class Forecaster:
     """Harness-facing wrapper for the selected forecasting baseline."""
 
@@ -339,6 +593,7 @@ class Forecaster:
 
     SCAFFOLD = "scaffold"
     WEEKLY = "weekly"
+    RIDGE = "ridge"
 
     def __init__(self, specs: SiteSpecs, model_name: str = SELECTED_MODEL) -> None:
         self.specs = specs
@@ -346,11 +601,15 @@ class Forecaster:
         self.model = self._make_model(model_name)
 
     @staticmethod
-    def _make_model(model_name: str) -> ScaffoldBaseline | WeeklySeasonalBaseline:
+    def _make_model(
+        model_name: str,
+    ) -> ScaffoldBaseline | WeeklySeasonalBaseline | DirectRidgeNetLoadModel:
         if model_name == Forecaster.SCAFFOLD:
             return ScaffoldBaseline()
         if model_name == Forecaster.WEEKLY:
             return WeeklySeasonalBaseline()
+        if model_name == Forecaster.RIDGE:
+            return DirectRidgeNetLoadModel()
         raise ValueError(f"Unknown forecasting model: {model_name}")
 
     def fit(self, history: pd.DataFrame) -> None:
@@ -368,12 +627,16 @@ class Forecaster:
         (Path(path) / self.PARAMS).write_text(
             json.dumps({"model_name": self.model_name, "state": self.model.state()})
         )
+        if isinstance(self.model, DirectRidgeNetLoadModel):
+            self.model.save_artifact(path)
 
     @classmethod
     def load(cls, path: Path, specs: SiteSpecs) -> "Forecaster":
         params = json.loads((Path(path) / cls.PARAMS).read_text())
         self = cls(specs, model_name=params["model_name"])
         self.model.load_state(params["state"])
+        if isinstance(self.model, DirectRidgeNetLoadModel):
+            self.model.load_artifact(path)
         return self
 
     def predict(
@@ -384,5 +647,8 @@ class Forecaster:
         horizon: int,
     ) -> pd.DataFrame:
         index = future_exog.index[:horizon]
-        values = self.model.predict(history, index)
+        if isinstance(self.model, DirectRidgeNetLoadModel):
+            values = self.model.predict(history, future_exog, index, at_time)
+        else:
+            values = self.model.predict(history, index)
         return pd.DataFrame({"net_kw": values}, index=index)
