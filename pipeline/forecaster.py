@@ -62,6 +62,74 @@ LOGGER = logging.getLogger(__name__)
 # This is the one place that controls the model used by the standard training command.
 SELECTED_MODEL = "scaffold"   # weekly or scaffold
 
+# Central feature definition for direct net-load forecasting.
+NET_LOAD_LAGS = {
+    "lag_15min_kw": pd.Timedelta(minutes=15),
+    "lag_30min_kw": pd.Timedelta(minutes=30),
+    "lag_1day_kw": pd.Timedelta(days=1),
+    "lag_1week_kw": pd.Timedelta(days=7),
+}
+NET_LOAD_ROLLING_WINDOWS = {
+    "rolling_mean_1h_kw": pd.Timedelta(hours=1),
+    "rolling_mean_24h_kw": pd.Timedelta(days=1),
+}
+KNOWN_FUTURE_COLUMNS = ("most_recent_load_factor_forecast",)
+
+
+def build_net_load_features(
+    history: pd.DataFrame,
+    timestamps: pd.DatetimeIndex,
+    known_future: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Build model-independent, leakage-safe features for ``grid_net_kw``.
+
+    ``history`` supplies observed net load. For inference, ``known_future`` supplies
+    values known at prediction time; for training those values may be read from the
+    corresponding rows of ``history``.
+    """
+
+    if not isinstance(history.index, pd.DatetimeIndex):
+        raise ValueError("History must have a DatetimeIndex")
+    if not isinstance(timestamps, pd.DatetimeIndex):
+        raise ValueError("Feature timestamps must be a DatetimeIndex")
+    if history.index.has_duplicates:
+        raise ValueError("History contains duplicate timestamps")
+    if timestamps.has_duplicates:
+        raise ValueError("Feature timestamps contain duplicates")
+    if "grid_net_kw" not in history:
+        raise ValueError("History must contain grid_net_kw")
+
+    features = pd.DataFrame(index=timestamps)
+    features["quarter_of_day"] = timestamps.hour * 4 + timestamps.minute // 15
+    features["day_of_week"] = timestamps.dayofweek
+    features["is_weekend"] = (timestamps.dayofweek >= 5).astype(int)
+    features["month"] = timestamps.month
+
+    net_load = pd.to_numeric(history["grid_net_kw"], errors="coerce").sort_index()
+    for column, lag in NET_LOAD_LAGS.items():
+        lagged = net_load.reindex(timestamps - lag)
+        features[column] = lagged.to_numpy()
+
+    # Add target timestamps as empty rows so rolling values are calculated at the
+    # requested instants. ``closed="left"`` strictly excludes the target itself.
+    rolling_source = net_load.reindex(net_load.index.union(timestamps)).sort_index()
+    for column, window in NET_LOAD_ROLLING_WINDOWS.items():
+        features[column] = (
+            rolling_source.rolling(
+                window, closed="left", min_periods=int(window / STEP)
+            )
+            .mean()
+            .reindex(timestamps)
+        )
+
+    future_values = history if known_future is None else known_future
+    for column in KNOWN_FUTURE_COLUMNS:
+        if column not in future_values:
+            raise ValueError(f"Known future data must contain {column}")
+        features[column] = future_values[column].reindex(timestamps)
+
+    return features
+
 
 def validate_and_clean_history(
     history: pd.DataFrame,
