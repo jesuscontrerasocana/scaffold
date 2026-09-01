@@ -136,3 +136,9 @@ When multiple implementations are reasonable, prefer the one that is easier to:
 * explain during the interview
 
 If a requested change can be implemented cleanly without adding a new abstraction, do that.
+
+## Changelodg
+
+- Update `CHANGELOG.md` every meaningful change - modeling, inputs or outputs.
+- Do not add entries for internal refactors, formatting, or test-only changes.
+- Keep entries concise and outcome-focused.
