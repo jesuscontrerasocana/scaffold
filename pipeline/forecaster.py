@@ -62,7 +62,7 @@ from pipeline.specs import SiteSpecs
 LOGGER = logging.getLogger(__name__)
 
 # This is the one place that controls the model used by the standard training command.
-SELECTED_MODEL = "scaffold"   # ridge, weekly, or scaffold
+SELECTED_MODEL = "ridge"   # ridge, weekly, or scaffold
 
 CALENDAR_FEATURES = ("time_of_day", "day_of_week", "is_weekend", "month")
 
