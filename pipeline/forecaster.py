@@ -48,6 +48,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.feature_selection import SequentialFeatureSelector
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+import joblib
 
 from pipeline.data import REQUIRED_COLUMNS, STEP
 from pipeline.specs import SiteSpecs
@@ -55,7 +62,7 @@ from pipeline.specs import SiteSpecs
 LOGGER = logging.getLogger(__name__)
 
 # This is the one place that controls the model used by the standard training command.
-SELECTED_MODEL = "scaffold"   # weekly or scaffold
+SELECTED_MODEL = "scaffold"   # ridge, weekly, or scaffold
 
 CALENDAR_FEATURES = ("time_of_day", "day_of_week", "is_weekend", "month")
 
@@ -332,6 +339,232 @@ class WeeklySeasonalBaseline:
         self._validate_time_of_week_medians()
 
 
+class RidgeNetLoadModel:
+    """Direct net-load Ridge forecast with decision-time-safe history features."""
+
+    ARTIFACT = "model.joblib"
+    ALPHA = 1.0
+    MAX_HORIZON = 132
+    LAGS = (
+        pd.Timedelta(minutes=15),
+        pd.Timedelta(hours=1),
+        pd.Timedelta(days=1),
+        pd.Timedelta(days=7),
+    )
+    WINDOWS = (pd.Timedelta(hours=1), pd.Timedelta(hours=4))
+    EXOG_FEATURE = "most_recent_load_factor_forecast"
+    CALENDAR_COLUMNS = (
+        "time_of_day_sin",
+        "time_of_day_cos",
+        "dow_0",
+        "dow_1",
+        "dow_2",
+        "dow_3",
+        "dow_4",
+        "dow_5",
+        "dow_6",
+    )
+    CONTINUOUS_COLUMNS = (
+        "lag_15min",
+        "lag_1h",
+        "lag_1day",
+        "lag_7day",
+        "rolling_mean_1h",
+        "rolling_mean_4h",
+        EXOG_FEATURE,
+    )
+
+    def __init__(self) -> None:
+        self.selected_continuous_features: list[str] = []
+        self.feature_names: list[str] = []
+        self.fill_values: dict[str, float] = {}
+        self.scaler = StandardScaler()
+        self.regressor = Ridge(alpha=self.ALPHA)
+        self.training_summary: dict[str, object] = {}
+
+    @classmethod
+    def _calendar(cls, index: pd.DatetimeIndex) -> pd.DataFrame:
+        slot = index.hour * 4 + index.minute // 15
+        angle = 2 * np.pi * slot / 96
+        result = pd.DataFrame(
+            {
+                "time_of_day_sin": np.sin(angle),
+                "time_of_day_cos": np.cos(angle),
+            },
+            index=index,
+        )
+        for day in range(7):
+            result[f"dow_{day}"] = (index.dayofweek == day).astype(float)
+        return result
+
+    @classmethod
+    def _continuous_features(
+        cls,
+        net: pd.Series,
+        exog: pd.Series,
+        targets: pd.DatetimeIndex,
+        decisions: pd.DatetimeIndex,
+    ) -> pd.DataFrame:
+        """Build candidates, masking observations unavailable at each decision."""
+
+        features = pd.DataFrame(index=targets)
+        numeric_net = pd.to_numeric(net, errors="coerce")
+        for lag in cls.LAGS:
+            source = targets - lag
+            values = numeric_net.reindex(source).to_numpy(dtype=float, copy=True)
+            values[source >= decisions] = np.nan
+            features[f"lag_{_offset_label(lag)}"] = values
+
+        rolling = build_rolling_features(numeric_net, targets, cls.WINDOWS)
+        for window in cls.WINDOWS:
+            column = f"rolling_mean_{_offset_label(window)}"
+            values = rolling[column].to_numpy(dtype=float, copy=True)
+            values[targets - STEP >= decisions] = np.nan
+            features[column] = values
+
+        features[cls.EXOG_FEATURE] = pd.to_numeric(
+            exog.reindex(targets), errors="coerce"
+        ).to_numpy(dtype=float)
+        return features
+
+    def _fill_continuous(self, features: pd.DataFrame) -> pd.DataFrame:
+        return features.loc[:, self.CONTINUOUS_COLUMNS].fillna(self.fill_values)
+
+    def fit(self, history: pd.DataFrame) -> None:
+        targets = history.index
+        # Cycle through the operational lead times so training rows reproduce the
+        # same information boundaries as forecasts without expanding data 132-fold.
+        leads = np.arange(len(targets)) % self.MAX_HORIZON + 1
+        decisions = targets - (leads - 1) * STEP
+        continuous = self._continuous_features(
+            history["grid_net_kw"],
+            history[self.EXOG_FEATURE],
+            targets,
+            decisions,
+        )
+        target = pd.to_numeric(history["grid_net_kw"], errors="coerce")
+        usable_target = target.notna() & np.isfinite(target)
+        dropped = int((~usable_target).sum())
+        continuous = continuous.loc[usable_target]
+        target = target.loc[usable_target]
+        calendar = self._calendar(continuous.index)
+
+        self.fill_values = {
+            column: float(continuous[column].median())
+            for column in self.CONTINUOUS_COLUMNS
+        }
+        if not all(np.isfinite(list(self.fill_values.values()))):
+            raise ValueError("Training history cannot populate all Ridge features")
+        continuous = self._fill_continuous(continuous)
+        if len(continuous) < 12:
+            raise ValueError("Ridge training requires at least 12 usable rows")
+
+        split_count = min(5, max(2, len(continuous) // 20))
+        cv = TimeSeriesSplit(n_splits=split_count)
+        selector = SequentialFeatureSelector(
+            make_pipeline(StandardScaler(), Ridge(alpha=self.ALPHA)),
+            direction="forward",
+            scoring="neg_mean_absolute_error",
+            cv=cv,
+        )
+        selector.fit(continuous, target)
+        self.selected_continuous_features = list(
+            np.asarray(self.CONTINUOUS_COLUMNS)[selector.get_support()]
+        )
+        self.feature_names = list(self.CALENDAR_COLUMNS) + self.selected_continuous_features
+
+        scaled_continuous = self.scaler.fit_transform(continuous)
+        selected_positions = [
+            self.CONTINUOUS_COLUMNS.index(name)
+            for name in self.selected_continuous_features
+        ]
+        design = np.column_stack(
+            [calendar.loc[:, self.CALENDAR_COLUMNS], scaled_continuous[:, selected_positions]]
+        )
+        validation_train, validation_test = list(cv.split(design))[-1]
+        validation_model = Ridge(alpha=self.ALPHA).fit(
+            design[validation_train], target.iloc[validation_train]
+        )
+        validation_prediction = validation_model.predict(design[validation_test])
+        self.regressor.fit(design, target)
+        train_prediction = self.regressor.predict(design)
+        self.training_summary = {
+            "train_mae": float(mean_absolute_error(target, train_prediction)),
+            "train_rmse": float(mean_squared_error(target, train_prediction) ** 0.5),
+            "validation_mae": float(
+                mean_absolute_error(target.iloc[validation_test], validation_prediction)
+            ),
+            "validation_rmse": float(
+                mean_squared_error(target.iloc[validation_test], validation_prediction) ** 0.5
+            ),
+            "training_samples": len(target),
+            "dropped_rows": dropped,
+        }
+
+    def predict(
+        self,
+        history: pd.DataFrame,
+        future_exog: pd.DataFrame,
+        index: pd.DatetimeIndex,
+        at_time: pd.Timestamp,
+    ) -> pd.Series:
+        decisions = pd.DatetimeIndex([at_time] * len(index))
+        continuous = self._continuous_features(
+            history["grid_net_kw"],
+            future_exog[self.EXOG_FEATURE],
+            index,
+            decisions,
+        )
+        scaled = self.scaler.transform(self._fill_continuous(continuous))
+        positions = [
+            self.CONTINUOUS_COLUMNS.index(name)
+            for name in self.selected_continuous_features
+        ]
+        design = np.column_stack(
+            [self._calendar(index).loc[:, self.CALENDAR_COLUMNS], scaled[:, positions]]
+        )
+        return pd.Series(self.regressor.predict(design), index=index)
+
+    def state(self) -> dict[str, object]:
+        return {
+            "selected_continuous_features": self.selected_continuous_features,
+            "feature_names": self.feature_names,
+            "fill_values": self.fill_values,
+            "training_summary": self.training_summary,
+        }
+
+    def load_state(self, state: dict[str, object]) -> None:
+        self.selected_continuous_features = list(state["selected_continuous_features"])
+        self.feature_names = list(state["feature_names"])
+        self.fill_values = {
+            str(name): float(value) for name, value in state["fill_values"].items()
+        }
+        self.training_summary = dict(state["training_summary"])
+
+    def summary(self) -> dict[str, object]:
+        return {
+            **self.training_summary,
+            "selected_features": self.feature_names,
+            "coefficients": dict(
+                zip(self.feature_names, self.regressor.coef_, strict=True)
+            ),
+            "intercept": float(self.regressor.intercept_),
+            "alpha": self.ALPHA,
+            "coefficient_space": "standardized continuous features; unscaled calendar features",
+        }
+
+    def save_artifact(self, path: Path) -> None:
+        joblib.dump(
+            {"scaler": self.scaler, "regressor": self.regressor},
+            Path(path) / self.ARTIFACT,
+        )
+
+    def load_artifact(self, path: Path) -> None:
+        artifact = joblib.load(Path(path) / self.ARTIFACT)
+        self.scaler = artifact["scaler"]
+        self.regressor = artifact["regressor"]
+
+
 class Forecaster:
     """Harness-facing wrapper for the selected forecasting baseline."""
 
@@ -339,6 +572,7 @@ class Forecaster:
 
     SCAFFOLD = "scaffold"
     WEEKLY = "weekly"
+    RIDGE = "ridge"
 
     def __init__(self, specs: SiteSpecs, model_name: str = SELECTED_MODEL) -> None:
         self.specs = specs
@@ -346,11 +580,15 @@ class Forecaster:
         self.model = self._make_model(model_name)
 
     @staticmethod
-    def _make_model(model_name: str) -> ScaffoldBaseline | WeeklySeasonalBaseline:
+    def _make_model(
+        model_name: str,
+    ) -> ScaffoldBaseline | WeeklySeasonalBaseline | RidgeNetLoadModel:
         if model_name == Forecaster.SCAFFOLD:
             return ScaffoldBaseline()
         if model_name == Forecaster.WEEKLY:
             return WeeklySeasonalBaseline()
+        if model_name == Forecaster.RIDGE:
+            return RidgeNetLoadModel()
         raise ValueError(f"Unknown forecasting model: {model_name}")
 
     def fit(self, history: pd.DataFrame) -> None:
@@ -368,12 +606,16 @@ class Forecaster:
         (Path(path) / self.PARAMS).write_text(
             json.dumps({"model_name": self.model_name, "state": self.model.state()})
         )
+        if isinstance(self.model, RidgeNetLoadModel):
+            self.model.save_artifact(path)
 
     @classmethod
     def load(cls, path: Path, specs: SiteSpecs) -> "Forecaster":
         params = json.loads((Path(path) / cls.PARAMS).read_text())
         self = cls(specs, model_name=params["model_name"])
         self.model.load_state(params["state"])
+        if isinstance(self.model, RidgeNetLoadModel):
+            self.model.load_artifact(path)
         return self
 
     def predict(
@@ -384,5 +626,8 @@ class Forecaster:
         horizon: int,
     ) -> pd.DataFrame:
         index = future_exog.index[:horizon]
-        values = self.model.predict(history, index)
+        if isinstance(self.model, RidgeNetLoadModel):
+            values = self.model.predict(history, future_exog, index, at_time)
+        else:
+            values = self.model.predict(history, index)
         return pd.DataFrame({"net_kw": values}, index=index)
