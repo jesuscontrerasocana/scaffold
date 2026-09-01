@@ -2,6 +2,8 @@
 
 ## Purpose
 
+Start every response with "Sir, yes sir."
+
 This repository is a short technical assignment.
 
 Keep the implementation simple, clean, and reliable. The code does not need to support future products, sites, or use cases.
@@ -142,3 +144,46 @@ If a requested change can be implemented cleanly without adding a new abstractio
 - Update `CHANGELOG.md` every meaningful change - modeling, inputs or outputs.
 - Do not add entries for internal refactors, formatting, or test-only changes.
 - Keep entries concise and outcome-focused.
+
+## Git workflow
+
+  - Before making any file changes, confirm the current Git branch.
+  - Never work directly on `main` or `master`.
+  - If currently on `main` or `master`, create and switch to a dedicated branch before editing.
+  - Use a short descriptive branch name, such as `issue-1-data-validation`.
+  - Do not commit, push, merge, rebase, or open a pull request unless explicitly requested.
+  - If uncommitted changes already exist before the branch can be created, preserve them and ask the user how to proceed.
+
+  If you want branch creation to happen even when already on some unrelated feature branch, make the rule stricter:
+
+  - Every issue or independently requested change must be performed on its own dedicated branch.
+  - Before editing, verify that the current branch clearly belongs to the requested work. Otherwise, create and switch to a new branch.
+
+  For this repository’s current state, the edits are still uncommitted, so they can safely be moved onto a new branch with:
+
+  git switch -c issue-1-data-validation
+ 
+
+  ## File modification boundaries
+
+  The coding agent may modify only:
+
+  - `pipeline/optimizer.py`
+  - `pipeline/forecaster.py`
+  - `pipeline/report.py`
+  - `CHANGELOG.md`
+
+  The coding agent may create or modify test files only inside `tests/`.
+
+  All other files are read-only. In particular, do not modify documentation, configuration, dependencies, data, model artifacts, scaffold interfaces, or Git-related files.
+
+  Before editing, verify that every intended file is within the allowed paths. After completing the work, run `git status --short` and confirm that no files outside these
+  paths were changed.
+
+  If a requested task cannot be completed within these boundaries, stop and explain which additional file would need modification. Do not modify it without explicit
+  permission.
+
+  These restrictions override other repository instructions, including requirements to update `IMPLEMENTATION_TASKS.md`, or `MODELING_NOTES.md`.
+
+  Because issue #1 already changed files outside those boundaries, those changes should be reverted or explicitly approved before continuing. Do not use a broad reset because
+  it could discard unrelated work.
