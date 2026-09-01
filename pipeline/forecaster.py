@@ -462,13 +462,7 @@ class RidgeNetLoadModel:
         if len(continuous) < 12:
             raise ValueError("Ridge training requires at least 12 usable rows")
 
-        holdout_size = max(1, len(continuous) // 5)
-        development = continuous.iloc[:-holdout_size]
-        development_target = target.iloc[:-holdout_size]
-        holdout = continuous.iloc[-holdout_size:]
-        holdout_target = target.iloc[-holdout_size:]
-
-        split_count = min(5, max(2, len(development) // 20))
+        split_count = min(5, max(2, len(continuous) // 20))
         cv = TimeSeriesSplit(n_splits=split_count)
         selector = SequentialFeatureSelector(
             make_pipeline(StandardScaler(), Ridge(alpha=self.ALPHA)),
@@ -476,7 +470,7 @@ class RidgeNetLoadModel:
             scoring="neg_mean_absolute_error",
             cv=cv,
         )
-        selector.fit(development, development_target)
+        selector.fit(continuous, target)
         self.selected_continuous_features = list(
             np.asarray(self.CONTINUOUS_COLUMNS)[selector.get_support()]
         )
@@ -486,26 +480,6 @@ class RidgeNetLoadModel:
             self.CONTINUOUS_COLUMNS.index(name)
             for name in self.selected_continuous_features
         ]
-        validation_scaler = StandardScaler().fit(development)
-        development_scaled = validation_scaler.transform(development)
-        holdout_scaled = validation_scaler.transform(holdout)
-        development_design = np.column_stack(
-            [
-                calendar.iloc[:-holdout_size].loc[:, self.CALENDAR_COLUMNS],
-                development_scaled[:, selected_positions],
-            ]
-        )
-        holdout_design = np.column_stack(
-            [
-                calendar.iloc[-holdout_size:].loc[:, self.CALENDAR_COLUMNS],
-                holdout_scaled[:, selected_positions],
-            ]
-        )
-        validation_model = Ridge(alpha=self.ALPHA).fit(
-            development_design, development_target
-        )
-        validation_prediction = validation_model.predict(holdout_design)
-
         scaled_continuous = self.scaler.fit_transform(continuous)
         design = np.column_stack(
             [calendar.loc[:, self.CALENDAR_COLUMNS], scaled_continuous[:, selected_positions]]
@@ -515,13 +489,6 @@ class RidgeNetLoadModel:
         self.training_summary = {
             "train_mae": float(mean_absolute_error(target, train_prediction)),
             "train_rmse": float(mean_squared_error(target, train_prediction) ** 0.5),
-            "validation_mae": float(
-                mean_absolute_error(holdout_target, validation_prediction)
-            ),
-            "validation_rmse": float(
-                mean_squared_error(holdout_target, validation_prediction) ** 0.5
-            ),
-            "validation_samples": len(holdout_target),
             "training_samples": len(target),
             "dropped_rows": dropped,
         }

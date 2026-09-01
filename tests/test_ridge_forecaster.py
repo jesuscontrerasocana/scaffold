@@ -60,7 +60,7 @@ def test_ridge_trains_predicts_and_exposes_summary(specs: SiteSpecs) -> None:
     assert summary["training_samples"] + summary["dropped_rows"] == len(history)
     assert summary["dropped_rows"] > 0
     assert summary["train_mae"] >= 0
-    assert summary["validation_rmse"] >= 0
+    assert "validation_rmse" not in summary
 
 
 def test_ridge_save_load_preserves_features_and_predictions(
