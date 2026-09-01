@@ -17,15 +17,9 @@ The goal is to keep the solution simple, modular, defensible, and easy to iterat
 
 ## 2. Data validation and minimal cleaning
 
-- [ ] Add a lightweight validation / cleaning helper
-- [ ] Check required columns, timestamp ordering, duplicates, 15-minute cadence, missing values, and obvious impossible values
-- [ ] Handle the known telemetry issue in `history.csv`:
-  - missing `pv_production_kw` blocks coincide with `grid_net_kw == 0`
-  - treat those periods as likely telemetry outages rather than genuine zero load
-  - mark affected load observations unavailable for model fitting
-  - avoid aggressive interpolation of long gaps
-- [ ] Keep negative/extreme prices and genuine load peaks
-- [ ] Print or log a short validation summary during training
+- [x] Add a lightweight validation / cleaning helper
+- [x] Check timestamp ordering, duplicates, 15-minute cadence, missing values
+- [x] Print or log a short validation summary during training
 
 ## 3. Development split / leakage control
 

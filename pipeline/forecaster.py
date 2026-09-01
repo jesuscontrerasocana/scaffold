@@ -43,11 +43,71 @@ want to hand the control layer more than a point forecast, that is how it travel
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
+from pipeline.data import REQUIRED_COLUMNS, STEP
 from pipeline.specs import SiteSpecs
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def validate_and_clean_history(
+    history: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Validate training history and return an unchanged-value copy with a summary.
+
+    Missing values are reported, not filled or used to remove rows. Unusual prices and
+    grid values are deliberately kept for downstream feature code to interpret locally.
+    """
+
+    cleaned = history.copy()
+    if not isinstance(cleaned.index, pd.DatetimeIndex):
+        try:
+            cleaned.index = pd.to_datetime(
+                cleaned.index, errors="raise", format="mixed"
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("History timestamps must be parseable") from error
+    if cleaned.index.isna().any():
+        raise ValueError("History timestamps must be parseable")
+    if not cleaned.index.is_monotonic_increasing:
+        raise ValueError("History timestamps must be ordered")
+    if cleaned.index.has_duplicates:
+        raise ValueError("History contains duplicate timestamps")
+
+    deltas = cleaned.index.to_series().diff().dropna()
+    if not deltas.eq(STEP).all():
+        raise ValueError(
+            "History must have a regular 15-minute cadence with no missing intervals"
+        )
+
+    try:
+        numeric = cleaned[REQUIRED_COLUMNS].apply(pd.to_numeric, errors="raise")
+    except (TypeError, ValueError) as error:
+        raise ValueError("Required history fields must be numeric") from error
+    if np.isinf(numeric.to_numpy(dtype=float)).any():
+        raise ValueError("History contains infinite values")
+
+    missing_by_column = {
+        column: {
+            "count": int(cleaned[column].isna().sum()),
+            "percentage": float(cleaned[column].isna().mean() * 100),
+        }
+        for column in REQUIRED_COLUMNS
+    }
+
+    summary: dict[str, object] = {
+        "rows": len(cleaned),
+        "start": cleaned.index.min(),
+        "end": cleaned.index.max(),
+        "missing_by_column": missing_by_column,
+    }
+    return cleaned, summary
 
 
 class Forecaster:
@@ -60,7 +120,18 @@ class Forecaster:
         self.fallback_kw = 0.0
 
     def fit(self, history: pd.DataFrame) -> None:
-        self.fallback_kw = float(history["grid_net_kw"].median())
+        cleaned, summary = validate_and_clean_history(history)
+        LOGGER.warning(
+            "Training data: %d rows (%s to %s); missing=%s; ",
+            summary["rows"],
+            summary["start"],
+            summary["end"],
+            summary["missing_by_column"],
+        )
+        fallback = cleaned["grid_net_kw"].median()
+        if pd.isna(fallback):
+            raise ValueError("History has no usable grid load observations")
+        self.fallback_kw = float(fallback)
 
     def save(self, path: Path) -> None:
         (Path(path) / self.PARAMS).write_text(
