@@ -34,11 +34,14 @@ The goal is to keep the solution simple, modular, defensible, and easy to iterat
 Implement a simple seasonal baseline first.
 
 Candidate logic:
-- same quarter previous day
-- fallback to same quarter previous week
-- fallback to historical time-of-week estimate / global fallback
+
+1. Use the same quarter-hour from the previous week.
+2. If that value is unavailable or invalid, fall back to the historical time-of-week median.
+
+The time-of-week fallback uses historical observations for the same weekday and quarter-hour, making it robust to isolated telemetry gaps.
 
 Tasks:
+- [ ] Refactor current code to keep the current forecaster.
 - [ ] Implement baseline
 - [ ] Add focused tests for missing-lag fallback
 - [ ] Evaluate on June
