@@ -65,7 +65,7 @@ def test_scaffold_model_keeps_all_fallback_stages_after_save_and_load(
     ] = np.nan
     forecaster = Forecaster(specs, model_name=Forecaster.SCAFFOLD)
     forecaster.fit(history)
-    expected = [123.0, 456.0, forecaster.fallback_kw]
+    expected = [123.0, 456.0, forecaster.model.fallback_kw]
 
     assert _predict(forecaster, history, at_time, horizon=3)["net_kw"].tolist() == expected
 

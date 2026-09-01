@@ -236,10 +236,6 @@ class Forecaster:
             return WeeklySeasonalBaseline()
         raise ValueError(f"Unknown forecasting model: {model_name}")
 
-    @property
-    def fallback_kw(self) -> float:
-        return self.model.fallback_kw
-
     def fit(self, history: pd.DataFrame) -> None:
         cleaned, summary = validate_and_clean_history(history)
         LOGGER.warning(
