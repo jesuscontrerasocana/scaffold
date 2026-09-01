@@ -57,81 +57,127 @@ LOGGER = logging.getLogger(__name__)
 # This is the one place that controls the model used by the standard training command.
 SELECTED_MODEL = "scaffold"   # weekly or scaffold
 
-# Central feature definition for time-series forecasting.
-TIMESERIES_LAGS = {
-    "lag_15min": pd.Timedelta(minutes=15),
-    "lag_1h": pd.Timedelta(hours=1),
-    "lag_1day": pd.DateOffset(days=1),
-    "lag_1week": pd.DateOffset(weeks=1),
-}
-TIMESERIES_ROLLING_WINDOWS = {
-    "rolling_mean_1h": pd.Timedelta(hours=1),
-    "rolling_mean_4h": pd.Timedelta(hours=4),
-}
+CALENDAR_FEATURES = ("time_of_day", "day_of_week", "is_weekend", "month")
 
 
-def build_timeseries_features(
-    history: pd.DataFrame,
+def _offset_label(offset: pd.Timedelta | pd.DateOffset) -> str:
+    """Return a concise deterministic label for a requested offset."""
+
+    if isinstance(offset, pd.Timedelta):
+        if offset <= pd.Timedelta(0):
+            raise ValueError("Timedelta lags and windows must be positive")
+        for unit, duration in (
+            ("day", pd.Timedelta(days=1)),
+            ("h", pd.Timedelta(hours=1)),
+            ("min", pd.Timedelta(minutes=1)),
+        ):
+            if offset % duration == pd.Timedelta(0):
+                return f"{int(offset / duration)}{unit}"
+        raise ValueError("Timedelta lags and windows must use whole minutes")
+
+    if isinstance(offset, pd.DateOffset) and offset.kwds:
+        invalid = any(
+            not isinstance(value, int) or value <= 0
+            for value in offset.kwds.values()
+        )
+        if invalid:
+            raise ValueError("Calendar lags must be positive whole units")
+        parts = [
+            f"{value}{unit.removesuffix('s')}"
+            for unit, value in sorted(offset.kwds.items())
+        ]
+        return "_".join(parts)
+
+    raise ValueError("Lags must be Timedelta or DateOffset values")
+
+
+def build_calendar_features(
     timestamps: pd.DatetimeIndex,
-    target_column: str,
-    known_future: pd.DataFrame | None = None,
+    features: list[str] | tuple[str, ...],
 ) -> pd.DataFrame:
-    """Build model-independent, leakage-safe features for a time-series target.
+    """Build the explicitly requested unencoded calendar features."""
 
-    ``history`` supplies observed target values. Any explicitly supplied
-    ``known_future`` columns are appended for the requested timestamps.
-    """
-
-    if not isinstance(history.index, pd.DatetimeIndex):
-        raise ValueError("History must have a DatetimeIndex")
     if not isinstance(timestamps, pd.DatetimeIndex):
         raise ValueError("Feature timestamps must be a DatetimeIndex")
-    if history.index.has_duplicates:
-        raise ValueError("History contains duplicate timestamps")
     if timestamps.has_duplicates:
         raise ValueError("Feature timestamps contain duplicates")
-    if target_column not in history:
-        raise ValueError(f"History must contain target column {target_column}")
+    unsupported = set(features) - set(CALENDAR_FEATURES)
+    if unsupported:
+        raise ValueError(f"Unsupported calendar features: {sorted(unsupported)}")
 
-    features = pd.DataFrame(index=timestamps)
-    features["quarter_of_day"] = timestamps.hour * 4 + timestamps.minute // 15
-    features["day_of_week"] = timestamps.dayofweek
-    features["is_weekend"] = (timestamps.dayofweek >= 5).astype(int)
-    features["month"] = timestamps.month
+    result = pd.DataFrame(index=timestamps)
+    for feature in features:
+        if feature == "time_of_day":
+            result[feature] = timestamps.hour * 4 + timestamps.minute // 15
+        elif feature == "day_of_week":
+            result[feature] = timestamps.dayofweek
+        elif feature == "is_weekend":
+            result[feature] = (timestamps.dayofweek >= 5).astype(int)
+        elif feature == "month":
+            result[feature] = timestamps.month
+    return result
 
-    target = pd.to_numeric(history[target_column], errors="coerce").sort_index()
-    for column, lag in TIMESERIES_LAGS.items():
-        lagged = target.reindex(timestamps - lag)
-        features[column] = lagged.to_numpy()
 
-    # Add target timestamps as empty rows so rolling values are calculated at the
-    # requested instants. ``closed="left"`` strictly excludes the target itself.
-    rolling_source = target.reindex(target.index.union(timestamps)).sort_index()
-    for column, window in TIMESERIES_ROLLING_WINDOWS.items():
-        features[column] = (
+def build_lag_features(
+    series: pd.Series,
+    timestamps: pd.DatetimeIndex,
+    lags: list[pd.Timedelta | pd.DateOffset] | tuple[pd.Timedelta | pd.DateOffset, ...],
+) -> pd.DataFrame:
+    """Build timestamp-matched features for explicitly requested past lags."""
+
+    _validate_feature_inputs(series, timestamps)
+    numeric = pd.to_numeric(series, errors="coerce").sort_index()
+    result = pd.DataFrame(index=timestamps)
+    for lag in lags:
+        column = f"lag_{_offset_label(lag)}"
+        if column in result:
+            raise ValueError(f"Duplicate lag feature: {column}")
+        lagged_timestamps = timestamps - lag
+        if len(timestamps) and not (lagged_timestamps < timestamps).all():
+            raise ValueError("Lags must refer strictly to past timestamps")
+        result[column] = numeric.reindex(lagged_timestamps).to_numpy()
+    return result
+
+
+def build_rolling_features(
+    series: pd.Series,
+    timestamps: pd.DatetimeIndex,
+    windows: list[pd.Timedelta] | tuple[pd.Timedelta, ...],
+) -> pd.DataFrame:
+    """Build complete rolling means from observations strictly before each timestamp."""
+
+    _validate_feature_inputs(series, timestamps)
+    numeric = pd.to_numeric(series, errors="coerce").sort_index()
+    rolling_source = numeric.reindex(numeric.index.union(timestamps)).sort_index()
+    result = pd.DataFrame(index=timestamps)
+    for window in windows:
+        label = _offset_label(window)
+        if not isinstance(window, pd.Timedelta) or window % STEP != pd.Timedelta(0):
+            raise ValueError("Rolling windows must be whole 15-minute intervals")
+        column = f"rolling_mean_{label}"
+        if column in result:
+            raise ValueError(f"Duplicate rolling feature: {column}")
+        result[column] = (
             rolling_source.rolling(
                 window, closed="left", min_periods=int(window / STEP)
             )
             .mean()
             .reindex(timestamps)
         )
+    return result
 
-    if known_future is not None:
-        if not isinstance(known_future.index, pd.DatetimeIndex):
-            raise ValueError("Known future data must have a DatetimeIndex")
-        if known_future.index.has_duplicates:
-            raise ValueError("Known future data contains duplicate timestamps")
-        if target_column in known_future.columns:
-            raise ValueError("Known future data must not contain the target column")
-        overlap = features.columns.intersection(known_future.columns)
-        if not overlap.empty:
-            raise ValueError(
-                f"Known future columns conflict with features: {list(overlap)}"
-            )
-        for column in known_future.columns:
-            features[column] = known_future[column].reindex(timestamps)
 
-    return features
+def _validate_feature_inputs(
+    series: pd.Series, timestamps: pd.DatetimeIndex
+) -> None:
+    if not isinstance(series.index, pd.DatetimeIndex):
+        raise ValueError("Series must have a DatetimeIndex")
+    if not isinstance(timestamps, pd.DatetimeIndex):
+        raise ValueError("Feature timestamps must be a DatetimeIndex")
+    if series.index.has_duplicates:
+        raise ValueError("Series contains duplicate timestamps")
+    if timestamps.has_duplicates:
+        raise ValueError("Feature timestamps contain duplicates")
 
 
 def validate_and_clean_history(
