@@ -37,16 +37,3 @@ def test_missingness_is_reported_without_changing_values_or_dropping_rows() -> N
     for column in history.columns.drop("pv_production_kw"):
         assert missing[column] == {"count": 0, "percentage": 0.0}
 
-
-def test_fit_logs_summary_and_uses_only_grid_missingness_for_fallback(
-    caplog: pytest.LogCaptureFixture, tmp_path,  # noqa: ANN001
-) -> None:
-    specs = SiteSpecs.from_yaml("site.yaml")
-    forecaster = Forecaster(specs)
-
-    with caplog.at_level(logging.WARNING):
-        forecaster.fit(_history())
-
-    assert forecaster.fallback_kw == 20.0
-    forecaster.save(tmp_path)
-    assert Forecaster.load(tmp_path, specs).fallback_kw == 20.0

@@ -187,3 +187,16 @@ If a requested change can be implemented cleanly without adding a new abstractio
 
   Because issue #1 already changed files outside those boundaries, those changes should be reverted or explicitly approved before continuing. Do not use a broad reset because
   it could discard unrelated work.
+
+  ## Issue identification
+
+  When a request refers to “issue N” or “issue #N”, treat it as a repository issue-tracker reference, not as section N of a local task document.
+
+  Before creating a branch or editing files:
+
+  1. Retrieve and read the referenced issue from the repository’s configured remote.
+  2. Confirm the issue number, title, scope, and acceptance criteria.
+  3. Name the branch after the verified issue.
+
+  If the issue cannot be retrieved, stop and ask the user for its text. Do not substitute a similarly numbered section from `IMPLEMENTATION_TASKS.md` or another local
+  document.
