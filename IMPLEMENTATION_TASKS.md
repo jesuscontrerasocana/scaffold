@@ -72,7 +72,7 @@ Potential features:
 - `most_recent_load_factor_forecast`
 
 Tasks:
-- [ ] Implement common leakage-safe feature builder
+- [x] Implement common leakage-safe feature builder
 - [ ] Implement Ridge model
 - [ ] Implement HistGradientBoosting model
 - [ ] Compare both against the seasonal baseline on June
