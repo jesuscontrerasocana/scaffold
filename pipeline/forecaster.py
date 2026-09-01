@@ -57,30 +57,29 @@ LOGGER = logging.getLogger(__name__)
 # This is the one place that controls the model used by the standard training command.
 SELECTED_MODEL = "scaffold"   # weekly or scaffold
 
-# Central feature definition for direct net-load forecasting.
-NET_LOAD_LAGS = {
-    "lag_15min_kw": pd.Timedelta(minutes=15),
-    "lag_1h_kw": pd.Timedelta(hours=1),
-    "lag_1day_kw": pd.DateOffset(days=1),
-    "lag_1week_kw": pd.DateOffset(weeks=1),
+# Central feature definition for time-series forecasting.
+TIMESERIES_LAGS = {
+    "lag_15min": pd.Timedelta(minutes=15),
+    "lag_1h": pd.Timedelta(hours=1),
+    "lag_1day": pd.DateOffset(days=1),
+    "lag_1week": pd.DateOffset(weeks=1),
 }
-NET_LOAD_ROLLING_WINDOWS = {
-    "rolling_mean_1h_kw": pd.Timedelta(hours=1),
-    "rolling_mean_4h_kw": pd.Timedelta(hours=4),
+TIMESERIES_ROLLING_WINDOWS = {
+    "rolling_mean_1h": pd.Timedelta(hours=1),
+    "rolling_mean_4h": pd.Timedelta(hours=4),
 }
-KNOWN_FUTURE_COLUMNS = ("most_recent_load_factor_forecast",)
 
 
-def build_net_load_features(
+def build_timeseries_features(
     history: pd.DataFrame,
     timestamps: pd.DatetimeIndex,
+    target_column: str,
     known_future: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Build model-independent, leakage-safe features for ``grid_net_kw``.
+    """Build model-independent, leakage-safe features for a time-series target.
 
-    ``history`` supplies observed net load. For inference, ``known_future`` supplies
-    values known at prediction time; for training those values may be read from the
-    corresponding rows of ``history``.
+    ``history`` supplies observed target values. Any explicitly supplied
+    ``known_future`` columns are appended for the requested timestamps.
     """
 
     if not isinstance(history.index, pd.DatetimeIndex):
@@ -91,8 +90,8 @@ def build_net_load_features(
         raise ValueError("History contains duplicate timestamps")
     if timestamps.has_duplicates:
         raise ValueError("Feature timestamps contain duplicates")
-    if "grid_net_kw" not in history:
-        raise ValueError("History must contain grid_net_kw")
+    if target_column not in history:
+        raise ValueError(f"History must contain target column {target_column}")
 
     features = pd.DataFrame(index=timestamps)
     features["quarter_of_day"] = timestamps.hour * 4 + timestamps.minute // 15
@@ -100,15 +99,15 @@ def build_net_load_features(
     features["is_weekend"] = (timestamps.dayofweek >= 5).astype(int)
     features["month"] = timestamps.month
 
-    net_load = pd.to_numeric(history["grid_net_kw"], errors="coerce").sort_index()
-    for column, lag in NET_LOAD_LAGS.items():
-        lagged = net_load.reindex(timestamps - lag)
+    target = pd.to_numeric(history[target_column], errors="coerce").sort_index()
+    for column, lag in TIMESERIES_LAGS.items():
+        lagged = target.reindex(timestamps - lag)
         features[column] = lagged.to_numpy()
 
     # Add target timestamps as empty rows so rolling values are calculated at the
     # requested instants. ``closed="left"`` strictly excludes the target itself.
-    rolling_source = net_load.reindex(net_load.index.union(timestamps)).sort_index()
-    for column, window in NET_LOAD_ROLLING_WINDOWS.items():
+    rolling_source = target.reindex(target.index.union(timestamps)).sort_index()
+    for column, window in TIMESERIES_ROLLING_WINDOWS.items():
         features[column] = (
             rolling_source.rolling(
                 window, closed="left", min_periods=int(window / STEP)
@@ -117,11 +116,18 @@ def build_net_load_features(
             .reindex(timestamps)
         )
 
-    future_values = history if known_future is None else known_future
-    for column in KNOWN_FUTURE_COLUMNS:
-        if column not in future_values:
-            raise ValueError(f"Known future data must contain {column}")
-        features[column] = future_values[column].reindex(timestamps)
+    if known_future is not None:
+        if not isinstance(known_future.index, pd.DatetimeIndex):
+            raise ValueError("Known future data must have a DatetimeIndex")
+        if known_future.index.has_duplicates:
+            raise ValueError("Known future data contains duplicate timestamps")
+        overlap = features.columns.intersection(known_future.columns)
+        if not overlap.empty:
+            raise ValueError(
+                f"Known future columns conflict with features: {list(overlap)}"
+            )
+        for column in known_future.columns:
+            features[column] = known_future[column].reindex(timestamps)
 
     return features
 

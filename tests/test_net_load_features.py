@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from pipeline.forecaster import build_net_load_features
+from pipeline.forecaster import build_timeseries_features
 
 
 def _history(periods: int = 8 * 96) -> pd.DataFrame:
@@ -25,16 +25,23 @@ def test_calendar_and_known_future_features_are_built_for_requested_times() -> N
         [pd.Timestamp("2026-01-10 12:30", tz="Europe/Brussels")]
     )
     known_future = pd.DataFrame(
-        {"most_recent_load_factor_forecast": [0.75]}, index=timestamps
+        {
+            "most_recent_load_factor_forecast": [0.75],
+            "temperature_forecast": [12.0],
+        },
+        index=timestamps,
     )
 
-    features = build_net_load_features(history, timestamps, known_future)
+    features = build_timeseries_features(
+        history, timestamps, "grid_net_kw", known_future
+    )
 
     assert features.loc[timestamps[0], "quarter_of_day"] == 50
     assert features.loc[timestamps[0], "day_of_week"] == 5
     assert features.loc[timestamps[0], "is_weekend"] == 1
     assert features.loc[timestamps[0], "month"] == 1
     assert features.loc[timestamps[0], "most_recent_load_factor_forecast"] == 0.75
+    assert features.loc[timestamps[0], "temperature_forecast"] == 12.0
 
 
 def test_lags_use_exact_past_timestamps_and_leave_missing_history_unavailable() -> None:
@@ -42,13 +49,15 @@ def test_lags_use_exact_past_timestamps_and_leave_missing_history_unavailable() 
     timestamp = history.index[-1]
     history = history.drop(timestamp - pd.Timedelta(days=1))
 
-    features = build_net_load_features(history, pd.DatetimeIndex([timestamp]))
+    features = build_timeseries_features(
+        history, pd.DatetimeIndex([timestamp]), "grid_net_kw"
+    )
 
-    assert features.loc[timestamp, "lag_15min_kw"] == history.loc[
+    assert features.loc[timestamp, "lag_15min"] == history.loc[
         timestamp - pd.Timedelta(minutes=15), "grid_net_kw"
     ]
-    assert pd.isna(features.loc[timestamp, "lag_1day_kw"])
-    assert features.loc[timestamp, "lag_1week_kw"] == history.loc[
+    assert pd.isna(features.loc[timestamp, "lag_1day"])
+    assert features.loc[timestamp, "lag_1week"] == history.loc[
         timestamp - pd.Timedelta(days=7), "grid_net_kw"
     ]
 
@@ -57,19 +66,19 @@ def test_lag_and_rolling_features_never_use_current_or_future_values() -> None:
     history = _history()
     timestamp = history.index[-2]
     targets = pd.DatetimeIndex([timestamp])
-    before = build_net_load_features(history, targets)
+    before = build_timeseries_features(history, targets, "grid_net_kw")
 
     changed = history.copy()
     changed.loc[timestamp:, "grid_net_kw"] = 1_000_000.0
-    after = build_net_load_features(changed, targets)
+    after = build_timeseries_features(changed, targets, "grid_net_kw")
 
     historical_columns = [
-        "lag_15min_kw",
-        "lag_1h_kw",
-        "lag_1day_kw",
-        "lag_1week_kw",
-        "rolling_mean_1h_kw",
-        "rolling_mean_4h_kw",
+        "lag_15min",
+        "lag_1h",
+        "lag_1day",
+        "lag_1week",
+        "rolling_mean_1h",
+        "rolling_mean_4h",
     ]
     pd.testing.assert_series_equal(
         before.loc[timestamp, historical_columns],
@@ -82,9 +91,11 @@ def test_rolling_feature_is_missing_when_its_history_window_is_incomplete() -> N
     timestamp = history.index[-1]
     history = history.drop(timestamp - pd.Timedelta(minutes=30))
 
-    features = build_net_load_features(history, pd.DatetimeIndex([timestamp]))
+    features = build_timeseries_features(
+        history, pd.DatetimeIndex([timestamp]), "grid_net_kw"
+    )
 
-    assert pd.isna(features.loc[timestamp, "rolling_mean_1h_kw"])
+    assert pd.isna(features.loc[timestamp, "rolling_mean_1h"])
 
 
 def test_daily_and_weekly_lags_preserve_local_time_across_dst() -> None:
@@ -106,12 +117,12 @@ def test_daily_and_weekly_lags_preserve_local_time_across_dst() -> None:
         {"most_recent_load_factor_forecast": [0.75]}, index=[timestamp]
     )
 
-    features = build_net_load_features(
-        history, pd.DatetimeIndex([timestamp]), known_future
+    features = build_timeseries_features(
+        history, pd.DatetimeIndex([timestamp]), "grid_net_kw", known_future
     )
 
-    assert features.loc[timestamp, "lag_1day_kw"] == 10.0
-    assert features.loc[timestamp, "lag_1week_kw"] == 70.0
+    assert features.loc[timestamp, "lag_1day"] == 10.0
+    assert features.loc[timestamp, "lag_1week"] == 70.0
 
 
 def test_training_and_inference_use_the_same_feature_columns() -> None:
@@ -119,9 +130,28 @@ def test_training_and_inference_use_the_same_feature_columns() -> None:
     timestamps = history.index[-4:]
     future = history.loc[timestamps, ["most_recent_load_factor_forecast"]]
 
-    training = build_net_load_features(history, timestamps)
-    inference = build_net_load_features(
-        history.loc[history.index < timestamps[0]], timestamps, future
+    training = build_timeseries_features(
+        history, timestamps, "grid_net_kw", future
+    )
+    inference = build_timeseries_features(
+        history.loc[history.index < timestamps[0]],
+        timestamps,
+        "grid_net_kw",
+        future,
     )
 
     assert training.columns.tolist() == inference.columns.tolist()
+
+
+def test_features_can_be_built_from_another_target_column() -> None:
+    history = _history()
+    history["pv_production_kw"] = history["grid_net_kw"] * 2
+    timestamp = history.index[-1]
+
+    features = build_timeseries_features(
+        history, pd.DatetimeIndex([timestamp]), "pv_production_kw"
+    )
+
+    assert features.loc[timestamp, "lag_15min"] == history.loc[
+        timestamp - pd.Timedelta(minutes=15), "pv_production_kw"
+    ]
