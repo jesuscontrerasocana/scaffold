@@ -71,3 +71,35 @@ def test_rolling_forecast_alignment_and_information_boundary() -> None:
     assert comparisons["lead_steps"].tolist() == [1, 2, 3]
     assert comparisons["actual_kw"].tolist() == [2.0, 3.0, 4.0]
     assert comparisons["predicted_kw"].tolist() == [2.0, 3.0, 4.0]
+
+
+def test_component_forecasts_are_included_in_comparisons() -> None:
+    index = pd.date_range("2026-06-01", periods=6, freq="15min", tz="Europe/Brussels")
+    data = pd.DataFrame(
+        {
+            "grid_net_kw": [5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            "pv_production_kw": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "most_recent_load_factor_forecast": 0.1,
+            "offtake_price_eur_per_mwh": 50.0,
+            "injection_price_eur_per_mwh": 20.0,
+        },
+        index=index,
+    )
+
+    class ComponentForecaster:
+        def predict(self, at_time, history, future_exog, horizon):  # noqa: ANN001, ARG002
+            target = future_exog.index[:horizon]
+            return pd.DataFrame(
+                {"net_kw": 4.0, "load_kw": 7.0, "pv_kw": 3.0}, index=target
+            )
+
+    comparisons = collect_forecasts(
+        data,
+        ComponentForecaster(),
+        RunConfig(first_decision=index[2], last_decision=index[2], horizon_steps=3),
+    )
+
+    assert comparisons["predicted_load_kw"].tolist() == [7.0, 7.0, 7.0]
+    assert comparisons["predicted_pv_kw"].tolist() == [3.0, 3.0, 3.0]
+    assert comparisons["actual_load_kw"].tolist() == [10.0, 12.0, 14.0]
+    assert comparisons["actual_pv_kw"].tolist() == [3.0, 4.0, 5.0]

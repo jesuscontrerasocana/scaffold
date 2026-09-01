@@ -61,6 +61,9 @@ def test_full_horizon_and_decomposition_identity(trained) -> None:  # noqa: ANN0
     prediction = forecaster.predict(at_time, history, future, 132)
 
     pd.testing.assert_series_equal(prediction["net_kw"], load - pv, check_names=False)
+    pd.testing.assert_series_equal(prediction["load_kw"], load, check_names=False)
+    pd.testing.assert_series_equal(prediction["pv_kw"], pv, check_names=False)
+    assert prediction.columns.tolist() == ["net_kw", "load_kw", "pv_kw"]
     assert len(prediction) == 132
     assert np.isfinite(prediction["net_kw"]).all()
     assert (pv >= 0).all()

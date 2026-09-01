@@ -973,9 +973,14 @@ class Forecaster:
         horizon: int,
     ) -> pd.DataFrame:
         index = future_exog.index[:horizon]
-        if isinstance(
-            self.model, (DirectRidgeNetLoadModel, DecomposedRidgeNetLoadModel)
-        ):
+        if isinstance(self.model, DecomposedRidgeNetLoadModel):
+            load, pv = self.model._predict_components(
+                history, future_exog, index, at_time
+            )
+            return pd.DataFrame(
+                {"net_kw": load - pv, "load_kw": load, "pv_kw": pv}, index=index
+            )
+        if isinstance(self.model, DirectRidgeNetLoadModel):
             values = self.model.predict(history, future_exog, index, at_time)
         else:
             values = self.model.predict(history, index)

@@ -55,8 +55,6 @@ def collect_forecasts(
 
     rows: list[pd.DataFrame] = []
     for at_time in decision_times(data.index, config):
-        if at_time.hour == 0 and at_time.minute == 0:
-            print(at_time)
         history = data.loc[data.index < at_time]
         horizon_index = pd.date_range(
             at_time, periods=config.horizon_steps, freq=STEP, tz=data.index.tz
@@ -82,17 +80,25 @@ def collect_forecasts(
         if forecast[FORECAST_COL].isna().any():
             raise ValueError("Forecaster returned NaN or an incomplete horizon")
 
-        rows.append(
-            pd.DataFrame(
-                {
-                    "decision_time": at_time,
-                    "target_time": horizon_index,
-                    "lead_steps": np.arange(1, len(horizon_index) + 1),
-                    "actual_kw": data.loc[horizon_index, "grid_net_kw"].to_numpy(),
-                    "predicted_kw": forecast[FORECAST_COL].to_numpy(),
-                }
-            )
+        comparison = pd.DataFrame(
+            {
+                "decision_time": at_time,
+                "target_time": horizon_index,
+                "lead_steps": np.arange(1, len(horizon_index) + 1),
+                "actual_kw": data.loc[horizon_index, "grid_net_kw"].to_numpy(),
+                "predicted_kw": forecast[FORECAST_COL].to_numpy(),
+            }
         )
+        if {"load_kw", "pv_kw"}.issubset(forecast.columns):
+            comparison["predicted_load_kw"] = forecast["load_kw"].to_numpy()
+            comparison["predicted_pv_kw"] = forecast["pv_kw"].to_numpy()
+            if {"grid_net_kw", "pv_production_kw"}.issubset(data.columns):
+                actual_pv = data.loc[horizon_index, "pv_production_kw"]
+                comparison["actual_load_kw"] = (
+                    data.loc[horizon_index, "grid_net_kw"] + actual_pv
+                ).to_numpy()
+                comparison["actual_pv_kw"] = actual_pv.to_numpy()
+        rows.append(comparison)
 
     if not rows:
         raise ValueError("No forecasts were produced for the requested window")

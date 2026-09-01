@@ -130,3 +130,13 @@ def test_selected_model_and_state_survive_save_and_load(
 def test_unknown_model_is_rejected(specs: SiteSpecs) -> None:
     with pytest.raises(ValueError, match="Unknown forecasting model"):
         Forecaster(specs, model_name="unknown")
+
+
+@pytest.mark.parametrize("model_name", [Forecaster.SCAFFOLD, Forecaster.WEEKLY])
+def test_baselines_return_only_net_kw(specs: SiteSpecs, model_name: str) -> None:
+    history = _history()
+    forecaster = Forecaster(specs, model_name=model_name)
+    forecaster.fit(history)
+    at_time = history.index[-1] + pd.Timedelta(minutes=15)
+
+    assert _predict(forecaster, history, at_time).columns.tolist() == ["net_kw"]

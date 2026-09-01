@@ -12,3 +12,4 @@
 - Add leakage-safe target-minus-one-day and target-minus-seven-day Ridge features.
 - Remove unconditional progress output from forecast evaluation.
 - Add a direct decomposed Ridge model that forecasts site load and non-negative PV separately.
+- Expose decomposed load/PV forecasts in model output and forecast comparisons.
