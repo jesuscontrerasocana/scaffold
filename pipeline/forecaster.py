@@ -121,6 +121,8 @@ def build_timeseries_features(
             raise ValueError("Known future data must have a DatetimeIndex")
         if known_future.index.has_duplicates:
             raise ValueError("Known future data contains duplicate timestamps")
+        if target_column in known_future.columns:
+            raise ValueError("Known future data must not contain the target column")
         overlap = features.columns.intersection(known_future.columns)
         if not overlap.empty:
             raise ValueError(

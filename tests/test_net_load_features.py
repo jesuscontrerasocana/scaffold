@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from pipeline.forecaster import build_timeseries_features
 
@@ -155,3 +156,17 @@ def test_features_can_be_built_from_another_target_column() -> None:
     assert features.loc[timestamp, "lag_15min"] == history.loc[
         timestamp - pd.Timedelta(minutes=15), "pv_production_kw"
     ]
+
+
+def test_known_future_cannot_include_the_target_column() -> None:
+    history = _history()
+    timestamp = history.index[-1]
+    known_future = history.loc[[timestamp], ["grid_net_kw"]]
+
+    with pytest.raises(ValueError, match="must not contain the target column"):
+        build_timeseries_features(
+            history,
+            pd.DatetimeIndex([timestamp]),
+            "grid_net_kw",
+            known_future,
+        )
