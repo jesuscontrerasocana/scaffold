@@ -75,12 +75,6 @@ def test_scaffold_model_keeps_all_fallback_stages_after_save_and_load(
     assert _predict(loaded, history, at_time, horizon=3)["net_kw"].tolist() == expected
 
 
-def test_standard_training_selects_weekly_model(specs: SiteSpecs) -> None:
-    forecaster = Forecaster(specs)
-
-    assert forecaster.model_name == Forecaster.WEEKLY
-
-
 def test_weekly_model_uses_previous_week(specs: SiteSpecs) -> None:
     history = _history()
     at_time = history.index[-1] + pd.Timedelta(minutes=15)

@@ -52,11 +52,15 @@ import pandas as pd
 from pipeline.data import REQUIRED_COLUMNS, STEP
 from pipeline.specs import SiteSpecs
 
+HOURS_IN_DAY = 24
+TIME_STEPS_IN_HOUR = 4
+MINUTES_IN_HOUR = 60
+DAYS_IN_WEEK = 7
 
 LOGGER = logging.getLogger(__name__)
 
 # This is the one place that controls the model used by the standard training command.
-SELECTED_MODEL = "weekly"
+SELECTED_MODEL = "scaffold"   # weekly or scaffold
 
 
 def validate_and_clean_history(
@@ -149,19 +153,18 @@ class ScaffoldBaseline:
 class WeeklySeasonalBaseline:
     """Previous-week persistence with a historical time-of-week fallback."""
 
+
     def __init__(self) -> None:
-        self.fallback_kw = 0.0
         self.time_of_week_medians: dict[int, float] = {}
 
     @staticmethod
     def _slots(index: pd.DatetimeIndex) -> np.ndarray:
-        return index.dayofweek * 96 + index.hour * 4 + index.minute // 15
+        return index.dayofweek * HOURS_IN_DAY * TIME_STEPS_IN_HOUR + index.hour * TIME_STEPS_IN_HOUR + index.minute // (MINUTES_IN_HOUR / TIME_STEPS_IN_HOUR)
 
     def fit(self, history: pd.DataFrame) -> None:
         net = pd.to_numeric(history["grid_net_kw"], errors="coerce").replace(
             [np.inf, -np.inf], np.nan
         )
-        self.fallback_kw = _usable_median(net)
         by_slot = net.groupby(self._slots(history.index)).median().dropna()
         self.time_of_week_medians = {
             int(slot): float(value) for slot, value in by_slot.items()
@@ -175,21 +178,31 @@ class WeeklySeasonalBaseline:
         weekly.index = index
         fallback = pd.Series(
             [
-                self.time_of_week_medians.get(int(slot), self.fallback_kw)
+                self.time_of_week_medians.get(int(slot))
                 for slot in self._slots(index)
             ],
             index=index,
         )
+
+        expected_slots = set(range(DAYS_IN_WEEK * HOURS_IN_DAY * TIME_STEPS_IN_HOUR))
+
+        if set(self.time_of_week_medians) != expected_slots:
+            missing = sorted(expected_slots - set(self.time_of_week_medians))
+            raise ValueError(
+                f"Missing time-of-week medians for slots: {missing}"
+            )
+
+        if not all(np.isfinite(value) for value in self.time_of_week_medians.values()):
+            raise ValueError("Time-of-week medians contain invalid values")
+
         return weekly.fillna(fallback)
 
     def state(self) -> dict[str, object]:
         return {
-            "fallback_kw": self.fallback_kw,
             "time_of_week_medians": self.time_of_week_medians,
         }
 
     def load_state(self, state: dict[str, object]) -> None:
-        self.fallback_kw = float(state["fallback_kw"])
         medians = state["time_of_week_medians"]
         if not isinstance(medians, dict):
             raise ValueError("Invalid time-of-week median state")
