@@ -65,11 +65,11 @@ def test_lag_and_rolling_features_never_use_current_or_future_values() -> None:
 
     historical_columns = [
         "lag_15min_kw",
-        "lag_30min_kw",
+        "lag_1h_kw",
         "lag_1day_kw",
         "lag_1week_kw",
         "rolling_mean_1h_kw",
-        "rolling_mean_24h_kw",
+        "rolling_mean_4h_kw",
     ]
     pd.testing.assert_series_equal(
         before.loc[timestamp, historical_columns],
@@ -85,6 +85,33 @@ def test_rolling_feature_is_missing_when_its_history_window_is_incomplete() -> N
     features = build_net_load_features(history, pd.DatetimeIndex([timestamp]))
 
     assert pd.isna(features.loc[timestamp, "rolling_mean_1h_kw"])
+
+
+def test_daily_and_weekly_lags_preserve_local_time_across_dst() -> None:
+    timestamp = pd.Timestamp("2026-03-29 12:00", tz="Europe/Brussels")
+    previous_day = timestamp - pd.DateOffset(days=1)
+    previous_week = timestamp - pd.DateOffset(weeks=1)
+    elapsed_day = timestamp - pd.Timedelta(days=1)
+    elapsed_week = timestamp - pd.Timedelta(days=7)
+    history = pd.DataFrame(
+        {
+            "grid_net_kw": [70.0, 700.0, 10.0, 100.0],
+            "most_recent_load_factor_forecast": 0.5,
+        },
+        index=pd.DatetimeIndex(
+            [previous_week, elapsed_week, previous_day, elapsed_day]
+        ),
+    ).sort_index()
+    known_future = pd.DataFrame(
+        {"most_recent_load_factor_forecast": [0.75]}, index=[timestamp]
+    )
+
+    features = build_net_load_features(
+        history, pd.DatetimeIndex([timestamp]), known_future
+    )
+
+    assert features.loc[timestamp, "lag_1day_kw"] == 10.0
+    assert features.loc[timestamp, "lag_1week_kw"] == 70.0
 
 
 def test_training_and_inference_use_the_same_feature_columns() -> None:

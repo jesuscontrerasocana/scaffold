@@ -60,13 +60,13 @@ SELECTED_MODEL = "scaffold"   # weekly or scaffold
 # Central feature definition for direct net-load forecasting.
 NET_LOAD_LAGS = {
     "lag_15min_kw": pd.Timedelta(minutes=15),
-    "lag_30min_kw": pd.Timedelta(minutes=30),
-    "lag_1day_kw": pd.Timedelta(days=1),
-    "lag_1week_kw": pd.Timedelta(days=7),
+    "lag_1h_kw": pd.Timedelta(hours=1),
+    "lag_1day_kw": pd.DateOffset(days=1),
+    "lag_1week_kw": pd.DateOffset(weeks=1),
 }
 NET_LOAD_ROLLING_WINDOWS = {
     "rolling_mean_1h_kw": pd.Timedelta(hours=1),
-    "rolling_mean_24h_kw": pd.Timedelta(days=1),
+    "rolling_mean_4h_kw": pd.Timedelta(hours=4),
 }
 KNOWN_FUTURE_COLUMNS = ("most_recent_load_factor_forecast",)
 
