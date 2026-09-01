@@ -41,10 +41,10 @@ Candidate logic:
 The time-of-week fallback uses historical observations for the same weekday and quarter-hour, making it robust to isolated telemetry gaps.
 
 Tasks:
-- [ ] Refactor current code to keep the current forecaster.
-- [ ] Implement baseline
-- [ ] Add focused tests for missing-lag fallback
-- [ ] Evaluate on June
+- [x] Refactor current code to keep the current forecaster.
+- [x] Implement baseline
+- [x] Add focused tests for missing-lag fallback
+- [x] Evaluate on June
 
 ## 5. Forecast Model A — direct net-load forecast
 
