@@ -11,3 +11,4 @@
 - Align Ridge lead-minute metadata with the harness target-index convention.
 - Add leakage-safe target-minus-one-day and target-minus-seven-day Ridge features.
 - Remove unconditional progress output from forecast evaluation.
+- Add a direct decomposed Ridge model that forecasts site load and non-negative PV separately.
