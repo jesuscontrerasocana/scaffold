@@ -14,3 +14,4 @@
 - Add a direct decomposed Ridge model that forecasts site load and non-negative PV separately.
 - Expose decomposed load/PV forecasts in model output and forecast comparisons.
 - Evaluate available net, load, and PV forecasts with aggregate and per-lead metrics.
+- Add target time-of-day sine/cosine features to the decomposed PV Ridge model.
