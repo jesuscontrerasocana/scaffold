@@ -121,19 +121,31 @@ class Optimizer:
 
     MAX_HORIZON = 132
 
-    def __init__(self, specs: SiteSpecs) -> None:
+    def __init__(
+        self,
+        specs: SiteSpecs,
+        enforce_negative_price_exclusivity: bool = True,
+    ) -> None:
         self.specs = specs
+        self.enforce_negative_price_exclusivity = (
+            enforce_negative_price_exclusivity
+        )
         self.last_summary: dict[str, float | int | str] = {}
-        self.model = self._build_model()
+        self.model = self._build_model(self.MAX_HORIZON)
 
-    def _build_model(self) -> pyo.ConcreteModel:
+    def _build_model(
+        self,
+        horizon_steps: int,
+        *,
+        negative_steps: list[int] | None = None,
+    ) -> pyo.ConcreteModel:
         battery = self.specs.battery
         eta = battery.one_way_efficiency
         minimum_energy = battery.capacity_kwh * battery.min_soc
         maximum_energy = battery.capacity_kwh * battery.max_soc
 
         model = pyo.ConcreteModel()
-        model.steps = pyo.RangeSet(0, self.MAX_HORIZON - 1)
+        model.steps = pyo.RangeSet(0, horizon_steps - 1)
         model.net_kw = pyo.Param(model.steps, mutable=True, initialize=0.0)
         model.offtake_price = pyo.Param(model.steps, mutable=True, initialize=0.0)
         model.injection_price = pyo.Param(model.steps, mutable=True, initialize=0.0)
@@ -166,6 +178,19 @@ class Optimizer:
             rule=lambda m, step: m.grid_import[step] - m.grid_export[step]
             == m.net_kw[step] + m.charge[step] - m.discharge[step],
         )
+        if negative_steps:
+            model.negative_steps = pyo.Set(initialize=negative_steps)
+            model.charge_mode = pyo.Var(model.negative_steps, domain=pyo.Binary)
+            model.charge_exclusive = pyo.Constraint(
+                model.negative_steps,
+                rule=lambda m, step: m.charge[step]
+                <= battery.charge_power_kw * m.charge_mode[step],
+            )
+            model.discharge_exclusive = pyo.Constraint(
+                model.negative_steps,
+                rule=lambda m, step: m.discharge[step]
+                <= battery.discharge_power_kw * (1 - m.charge_mode[step]),
+            )
 
         degradation_per_internal_kwh = battery.cycle_cost_eur / (
             2 * battery.usable_capacity_kwh
@@ -212,7 +237,13 @@ class Optimizer:
         } <= set(prices.columns):
             raise ValueError("Forecast or prices are missing required columns")
         if len(forecast) == 0:
-            self.last_summary = {"solver_termination": "empty horizon"}
+            self.last_summary = {
+                "solver_termination": "empty horizon",
+                "solver_mode": "lp",
+                "negative_price_exclusivity_enabled": (
+                    self.enforce_negative_price_exclusivity
+                ),
+            }
             return pd.DataFrame(
                 columns=["battery_charge_kw", "battery_discharge_kw"],
                 index=forecast.index,
@@ -236,6 +267,12 @@ class Optimizer:
         # battery physics and grid limits are still enforced without inventing prices.
         offtake_price = np.where(published, offtake_price, 0.0)
         injection_price = np.where(published, injection_price, 0.0)
+        negative_steps = [
+            step
+            for step in range(len(forecast))
+            if published[step] and injection_price[step] < 0
+        ]
+        use_milp = self.enforce_negative_price_exclusivity and bool(negative_steps)
 
         battery = self.specs.battery
         eta = battery.one_way_efficiency
@@ -245,7 +282,11 @@ class Optimizer:
         if not minimum_energy <= initial_energy <= maximum_energy:
             raise ValueError("Initial state of charge is outside battery bounds")
 
-        model = self.model
+        model = (
+            self._build_model(len(forecast), negative_steps=negative_steps)
+            if use_milp
+            else self.model
+        )
         for step in model.steps:
             model.net_kw[step] = 0.0
             model.offtake_price[step] = 0.0
@@ -273,6 +314,10 @@ class Optimizer:
 
         self.last_summary = {
             "solver_termination": str(termination),
+            "solver_mode": "milp" if use_milp else "lp",
+            "negative_price_exclusivity_enabled": (
+                self.enforce_negative_price_exclusivity
+            ),
             "objective_eur": float(pyo.value(model.objective)),
             "energy_cost_eur": float(pyo.value(model.energy_cost)),
             "injection_value_eur": float(

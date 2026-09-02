@@ -133,6 +133,96 @@ def test_unpublished_prices_are_not_invented(specs: SiteSpecs) -> None:
     assert optimizer.last_summary["published_price_steps"] == 1
 
 
+def test_non_negative_prices_reuse_continuous_model(specs: SiteSpecs) -> None:
+    optimizer = Optimizer(specs)
+    model = optimizer.model
+    forecast, prices = _inputs([0.0], [50.0], [10.0])
+
+    optimizer.solve(forecast, prices, _context(forecast.index, 0.5))
+    optimizer.solve(forecast, prices, _context(forecast.index, 0.6))
+
+    assert optimizer.model is model
+    assert not hasattr(model, "charge_mode")
+    assert not any(
+        variable.is_binary()
+        for variable in model.component_data_objects(pyo.Var)
+    )
+    assert optimizer.last_summary["solver_mode"] == "lp"
+
+
+def test_negative_price_builds_milp_only_for_negative_steps(
+    specs: SiteSpecs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    optimizer = Optimizer(specs)
+    reusable_model = optimizer.model
+    built_models: list[pyo.ConcreteModel] = []
+    original_build_model = optimizer._build_model
+
+    def capture_model(
+        horizon_steps: int, *, negative_steps: list[int] | None = None
+    ) -> pyo.ConcreteModel:
+        model = original_build_model(horizon_steps, negative_steps=negative_steps)
+        built_models.append(model)
+        return model
+
+    monkeypatch.setattr(optimizer, "_build_model", capture_model)
+    forecast, prices = _inputs(
+        [-100.0, -100.0, -100.0],
+        [50.0, 50.0, 50.0],
+        [20.0, -1_000.0, 10.0],
+    )
+    schedule = optimizer.solve(
+        forecast, prices, _context(forecast.index, specs.battery.max_soc)
+    )
+
+    temporary_model = built_models[0]
+    assert optimizer.enforce_negative_price_exclusivity is True
+    assert optimizer.model is reusable_model
+    assert list(temporary_model.negative_steps) == [1]
+    assert list(temporary_model.charge_mode) == [1]
+    assert list(temporary_model.charge_exclusive) == [1]
+    assert list(temporary_model.discharge_exclusive) == [1]
+    assert not (
+        schedule.iloc[1]["battery_charge_kw"] > 1e-7
+        and schedule.iloc[1]["battery_discharge_kw"] > 1e-7
+    )
+    assert optimizer.last_summary["solver_mode"] == "milp"
+    assert optimizer.last_summary["negative_price_exclusivity_enabled"] is True
+
+
+def test_disabled_exclusivity_uses_reusable_lp_for_negative_price(
+    specs: SiteSpecs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    optimizer = Optimizer(specs, enforce_negative_price_exclusivity=False)
+    reusable_model = optimizer.model
+
+    def fail_if_called(*args: object, **kwargs: object) -> pyo.ConcreteModel:
+        raise AssertionError("Temporary model should not be built")
+
+    monkeypatch.setattr(optimizer, "_build_model", fail_if_called)
+    forecast, prices = _inputs([-100.0], [50.0], [-1_000.0])
+    optimizer.solve(
+        forecast, prices, _context(forecast.index, specs.battery.max_soc)
+    )
+
+    assert optimizer.model is reusable_model
+    assert optimizer.last_summary["solver_mode"] == "lp"
+    assert optimizer.last_summary["negative_price_exclusivity_enabled"] is False
+
+
+def test_unpublished_prices_do_not_build_temporary_milp(
+    specs: SiteSpecs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forecast, prices = _inputs([0.0], [np.nan], [-100.0])
+    optimizer = Optimizer(specs)
+
+    def fail_if_called(*args: object, **kwargs: object) -> pyo.ConcreteModel:
+        raise AssertionError("Temporary model should not be built")
+
+    monkeypatch.setattr(optimizer, "_build_model", fail_if_called)
+    optimizer.solve(forecast, prices, _context(forecast.index, 0.5))
+
+
 def test_model_and_mutable_inputs_are_reused_and_updated(specs: SiteSpecs) -> None:
     optimizer = Optimizer(specs)
     model = optimizer.model

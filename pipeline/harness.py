@@ -297,6 +297,8 @@ def run_backtest(  # noqa: PLR0914
 
         applied = horizon_index[: config.steps_per_decision]
         for ts in applied:
+            if ts.minute == 0 and ts.hour ==0:
+                print(ts)
             planned_charge = max(float(schedule.at[ts, CHARGE_COL]), 0.0)
             planned_discharge = max(float(schedule.at[ts, DISCHARGE_COL]), 0.0)
             simultaneous = planned_charge > TOL and planned_discharge > TOL

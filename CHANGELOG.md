@@ -17,3 +17,5 @@
 - Add target time-of-day sine/cosine features to the decomposed PV Ridge model.
 - Add a transparent Pyomo/HiGHS battery optimizer with physical, grid, energy-cost, and degradation constraints.
 - Reuse a fixed-size Pyomo optimizer model with mutable forecast, price, and initial-energy inputs.
+- Use a temporary MILP to prevent simultaneous battery charging and discharging only when published injection prices are negative.
+- Allow negative-price exclusivity to be disabled so all solves use the reusable LP.
