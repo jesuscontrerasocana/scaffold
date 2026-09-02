@@ -21,5 +21,6 @@
 - Allow negative-price exclusivity to be disabled so all solves use the reusable LP.
 - Add deterministic incremental monthly peak-capacity cost for current-month horizon steps.
 - Fill unpublished optimizer prices from the nearest historical same-type calendar day.
+- Limit decomposed Ridge inference to required recent and seasonal history observations.
 - Reuse APPSI HiGHS solver instances for continuous and temporary mixed-integer optimizer solves.
 - Add terminal energy constraint.

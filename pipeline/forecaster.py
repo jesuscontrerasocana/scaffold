@@ -795,32 +795,54 @@ class DecomposedRidgeNetLoadModel:
     ) -> tuple[pd.Series, pd.Series]:
         if len(index) > self.MAX_HORIZON:
             raise ValueError(f"Ridge horizon cannot exceed {self.MAX_HORIZON} steps")
-        known = history.loc[history.index < at_time]
-        pv = pd.to_numeric(known["pv_production_kw"], errors="coerce")
-        load = pd.to_numeric(known["grid_net_kw"], errors="coerce") + pv
-
-        load_recent = self._load_decision_features(
-            load, pd.DatetimeIndex([at_time])
-        ).iloc[0]
+        recent_index = pd.date_range(end=at_time - STEP, periods=16, freq=STEP)
+        recent = history.reindex(recent_index)
+        recent_pv = pd.to_numeric(recent["pv_production_kw"], errors="coerce")
+        recent_load = (
+            pd.to_numeric(recent["grid_net_kw"], errors="coerce") + recent_pv
+        )
+        load_recent = {
+            "load_lag_15min": recent_load.iloc[-1],
+            "load_lag_1h": recent_load.iloc[-4],
+            "load_rolling_mean_1h": (
+                recent_load.iloc[-4:].mean()
+                if recent_load.iloc[-4:].notna().all()
+                else np.nan
+            ),
+            "load_rolling_mean_4h": (
+                recent_load.mean() if recent_load.notna().all() else np.nan
+            ),
+        }
         load_features = DirectRidgeNetLoadModel._target_calendar(index)
         for name, value in load_recent.items():
             load_features[name] = value
-        seasonal = build_lag_features(
-            load, index, (pd.Timedelta(days=1), pd.Timedelta(days=7))
+
+        one_day_index = index - pd.Timedelta(days=1)
+        seven_day_index = index - pd.Timedelta(days=7)
+        seasonal_index = one_day_index[one_day_index < at_time].union(
+            seven_day_index[seven_day_index < at_time]
         )
-        load_features["load_target_minus_1day"] = seasonal["lag_1day"]
-        load_features.loc[
-            index - pd.Timedelta(days=1) >= at_time,
-            "load_target_minus_1day",
-        ] = np.nan
-        load_features["load_target_minus_7day"] = seasonal["lag_7day"]
+        seasonal = history.reindex(seasonal_index)
+        seasonal_pv = pd.to_numeric(
+            seasonal["pv_production_kw"], errors="coerce"
+        )
+        seasonal_load = (
+            pd.to_numeric(seasonal["grid_net_kw"], errors="coerce") + seasonal_pv
+        )
+        load_features["load_target_minus_1day"] = seasonal_load.reindex(
+            one_day_index
+        ).to_numpy()
+        load_features["load_target_minus_7day"] = seasonal_load.reindex(
+            seven_day_index
+        ).to_numpy()
         load_features = load_features.loc[:, self.LOAD_FEATURE_NAMES].fillna(
             self.load_fill_values
         )
 
-        pv_recent = self._pv_decision_features(
-            pv, pd.DatetimeIndex([at_time])
-        ).iloc[0]
+        pv_recent = {
+            "pv_lag_15min": recent_pv.iloc[-1],
+            "pv_lag_1h": recent_pv.iloc[-4],
+        }
         pv_features = DirectRidgeNetLoadModel._target_calendar(index).loc[
             :, ["time_of_day_sin", "time_of_day_cos"]
         ]
