@@ -36,7 +36,10 @@ def _inputs(
 
 
 def _context(
-    index: pd.DatetimeIndex, initial_soc: float, peak_offtake_kw: float = 100.0
+    index: pd.DatetimeIndex,
+    initial_soc: float,
+    peak_offtake_kw: float = 100.0,
+    history: pd.DataFrame | None = None,
 ) -> DecisionContext:
     return DecisionContext(
         at_time=index[0],
@@ -46,7 +49,11 @@ def _context(
             steps_elapsed=0,
             steps_total=96 * 31,
         ),
-        history=pd.DataFrame(index=pd.DatetimeIndex([], tz=index.tz)),
+        history=(
+            history
+            if history is not None
+            else pd.DataFrame(index=pd.DatetimeIndex([], tz=index.tz))
+        ),
         prices_known_until=index[-1],
         state={},
     )
@@ -237,6 +244,265 @@ def test_unpublished_prices_are_not_invented(specs: SiteSpecs) -> None:
         ["offtake_price_eur_per_mwh", "injection_price_eur_per_mwh"]
     ].notna().all(axis=1)
     assert published.sum() == 1
+    assert optimizer.last_summary["published_price_steps"] == 1
+    assert optimizer.last_summary["filled_price_steps"] == 0
+    assert optimizer.last_summary["price_fallback_reference_day"] == "unavailable"
+
+
+def test_unpublished_prices_use_previous_weekday_same_quarter_hour(
+    specs: SiteSpecs,
+) -> None:
+    index = pd.date_range("2026-01-06 10:00", periods=2, freq="15min", tz="UTC")
+    forecast = pd.DataFrame({"net_kw": [0.0, 0.0]}, index=index)
+    prices = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [99.0, np.nan],
+            "injection_price_eur_per_mwh": [88.0, np.nan],
+        },
+        index=index,
+    )
+    history_index = pd.DatetimeIndex(
+        ["2026-01-05 10:00", "2026-01-05 10:15"], tz="UTC"
+    )
+    history = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [10.0, 20.0],
+            "injection_price_eur_per_mwh": [1.0, 2.0],
+        },
+        index=history_index,
+    )
+    optimizer = Optimizer(specs)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(index, specs.battery.min_soc, history=history),
+    )
+
+    assert pyo.value(optimizer.model.offtake_price[0]) == 99.0
+    assert pyo.value(optimizer.model.injection_price[0]) == 88.0
+    assert pyo.value(optimizer.model.offtake_price[1]) == 20.0
+    assert pyo.value(optimizer.model.injection_price[1]) == 2.0
+    assert optimizer.last_summary["published_price_steps"] == 1
+    assert optimizer.last_summary["filled_price_steps"] == 1
+    assert optimizer.last_summary["price_fallback_reference_day"] == "2026-01-05"
+
+
+@pytest.mark.parametrize(
+    ("decision_time", "history_days", "expected_day"),
+    [
+        ("2026-01-05 10:00", ["2026-01-02", "2026-01-04"], "2026-01-02"),
+        ("2026-01-10 10:00", ["2026-01-04", "2026-01-09"], "2026-01-04"),
+        ("2026-01-11 10:00", ["2026-01-04", "2026-01-10"], "2026-01-10"),
+    ],
+)
+def test_price_fallback_uses_nearest_same_type_day(
+    specs: SiteSpecs,
+    decision_time: str,
+    history_days: list[str],
+    expected_day: str,
+) -> None:
+    index = pd.date_range(decision_time, periods=1, freq="15min", tz="UTC")
+    forecast = pd.DataFrame({"net_kw": [0.0]}, index=index)
+    prices = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [np.nan],
+            "injection_price_eur_per_mwh": [np.nan],
+        },
+        index=index,
+    )
+    history_index = pd.DatetimeIndex(
+        [f"{day} 10:00" for day in history_days], tz="UTC"
+    )
+    history = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [10.0, 20.0],
+            "injection_price_eur_per_mwh": [1.0, 2.0],
+        },
+        index=history_index,
+    )
+    optimizer = Optimizer(specs)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(index, specs.battery.min_soc, history=history),
+    )
+
+    expected_position = history_days.index(expected_day)
+    assert pyo.value(optimizer.model.offtake_price[0]) == [10.0, 20.0][expected_position]
+    assert pyo.value(optimizer.model.injection_price[0]) == [1.0, 2.0][expected_position]
+    assert optimizer.last_summary["price_fallback_reference_day"] == expected_day
+
+
+def test_price_fallback_ignores_history_at_or_after_decision(
+    specs: SiteSpecs,
+) -> None:
+    index = pd.date_range("2026-01-06 10:00", periods=1, freq="15min", tz="UTC")
+    forecast = pd.DataFrame({"net_kw": [0.0]}, index=index)
+    prices = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [np.nan],
+            "injection_price_eur_per_mwh": [np.nan],
+        },
+        index=index,
+    )
+    history_index = pd.DatetimeIndex(
+        ["2026-01-05 10:00", "2026-01-06 10:00"], tz="UTC"
+    )
+    history = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [10.0, 999.0],
+            "injection_price_eur_per_mwh": [1.0, 999.0],
+        },
+        index=history_index,
+    )
+    optimizer = Optimizer(specs)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(index, specs.battery.min_soc, history=history),
+    )
+
+    assert pyo.value(optimizer.model.offtake_price[0]) == 10.0
+    assert pyo.value(optimizer.model.injection_price[0]) == 1.0
+
+
+def test_price_fallback_does_not_search_older_days_for_missing_slots(
+    specs: SiteSpecs,
+) -> None:
+    index = pd.date_range("2026-01-06 10:00", periods=2, freq="15min", tz="UTC")
+    forecast = pd.DataFrame({"net_kw": [0.0, 0.0]}, index=index)
+    prices = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [np.nan, np.nan],
+            "injection_price_eur_per_mwh": [np.nan, np.nan],
+        },
+        index=index,
+    )
+    history = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [50.0, 10.0],
+            "injection_price_eur_per_mwh": [5.0, 1.0],
+        },
+        index=pd.DatetimeIndex(
+            ["2026-01-02 10:15", "2026-01-05 10:00"], tz="UTC"
+        ),
+    )
+    optimizer = Optimizer(specs)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(index, specs.battery.min_soc, history=history),
+    )
+
+    assert pyo.value(optimizer.model.offtake_price[0]) == 10.0
+    assert pyo.value(optimizer.model.injection_price[0]) == 1.0
+    assert pyo.value(optimizer.model.offtake_price[1]) == 0.0
+    assert pyo.value(optimizer.model.injection_price[1]) == 0.0
+    assert optimizer.last_summary["price_fallback_reference_day"] == "2026-01-05"
+
+
+def test_price_fallback_skips_reference_day_with_no_usable_prices(
+    specs: SiteSpecs,
+) -> None:
+    index = pd.date_range("2026-01-06 10:00", periods=1, freq="15min", tz="UTC")
+    forecast = pd.DataFrame({"net_kw": [0.0]}, index=index)
+    prices = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [np.nan],
+            "injection_price_eur_per_mwh": [np.nan],
+        },
+        index=index,
+    )
+    history = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [50.0, np.nan],
+            "injection_price_eur_per_mwh": [5.0, np.nan],
+        },
+        index=pd.DatetimeIndex(
+            ["2026-01-02 10:00", "2026-01-05 10:00"], tz="UTC"
+        ),
+    )
+    optimizer = Optimizer(specs)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(index, specs.battery.min_soc, history=history),
+    )
+
+    assert pyo.value(optimizer.model.offtake_price[0]) == 50.0
+    assert pyo.value(optimizer.model.injection_price[0]) == 5.0
+    assert optimizer.last_summary["price_fallback_reference_day"] == "2026-01-02"
+
+
+def test_price_fallback_selects_reference_day_per_price_column(
+    specs: SiteSpecs,
+) -> None:
+    index = pd.date_range("2026-01-06 10:00", periods=1, freq="15min", tz="UTC")
+    forecast = pd.DataFrame({"net_kw": [0.0]}, index=index)
+    prices = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [np.nan],
+            "injection_price_eur_per_mwh": [np.nan],
+        },
+        index=index,
+    )
+    history = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [50.0, 10.0],
+            "injection_price_eur_per_mwh": [5.0, np.nan],
+        },
+        index=pd.DatetimeIndex(
+            ["2026-01-02 10:00", "2026-01-05 10:00"], tz="UTC"
+        ),
+    )
+    optimizer = Optimizer(specs)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(index, specs.battery.min_soc, history=history),
+    )
+
+    assert pyo.value(optimizer.model.offtake_price[0]) == 10.0
+    assert pyo.value(optimizer.model.injection_price[0]) == 5.0
+    assert optimizer.last_summary["price_fallback_reference_day"] == (
+        "2026-01-02, 2026-01-05"
+    )
+
+
+def test_filled_negative_injection_price_uses_temporary_milp(
+    specs: SiteSpecs,
+) -> None:
+    index = pd.date_range("2026-01-06 10:00", periods=1, freq="15min", tz="UTC")
+    forecast = pd.DataFrame({"net_kw": [-100.0]}, index=index)
+    prices = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [np.nan],
+            "injection_price_eur_per_mwh": [np.nan],
+        },
+        index=index,
+    )
+    history = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [50.0],
+            "injection_price_eur_per_mwh": [-1_000.0],
+        },
+        index=pd.DatetimeIndex(["2026-01-05 10:00"], tz="UTC"),
+    )
+    optimizer = Optimizer(specs, enforce_negative_price_exclusivity=True)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(index, specs.battery.max_soc, history=history),
+    )
+
+    assert optimizer.last_summary["solver_mode"] == "milp"
 
 
 def test_non_negative_prices_reuse_continuous_model(specs: SiteSpecs) -> None:
