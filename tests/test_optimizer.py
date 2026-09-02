@@ -198,6 +198,32 @@ def test_dispatch_below_past_peak_receives_no_credit(specs: SiteSpecs) -> None:
     assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(0.0)
 
 
+def test_next_month_import_does_not_increase_current_month_peak(
+    specs: SiteSpecs,
+) -> None:
+    index = pd.DatetimeIndex(
+        ["2026-01-31 23:45", "2026-02-01 00:00"], tz="UTC"
+    )
+    forecast = pd.DataFrame({"net_kw": [40.0, 100.0]}, index=index)
+    prices = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [0.0, 0.0],
+            "injection_price_eur_per_mwh": [0.0, 0.0],
+        },
+        index=index,
+    )
+    optimizer = Optimizer(specs)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(index, specs.battery.min_soc, peak_offtake_kw=50.0),
+    )
+
+    assert optimizer.last_summary["planned_peak_kw"] == pytest.approx(50.0)
+    assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(0.0)
+
+
 def test_unpublished_prices_are_not_invented(specs: SiteSpecs) -> None:
     forecast, prices = _inputs([0.0, 0.0], [0.0, np.nan])
     prices.iloc[1, prices.columns.get_loc("injection_price_eur_per_mwh")] = np.nan
@@ -233,7 +259,7 @@ def test_non_negative_prices_reuse_continuous_model(specs: SiteSpecs) -> None:
 def test_negative_price_builds_milp_only_for_negative_steps(
     specs: SiteSpecs, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    optimizer = Optimizer(specs)
+    optimizer = Optimizer(specs, enforce_negative_price_exclusivity=True)
     reusable_model = optimizer.model
     built_models: list[pyo.ConcreteModel] = []
     original_build_model = optimizer._build_model

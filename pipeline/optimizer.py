@@ -149,6 +149,9 @@ class Optimizer:
         model.net_kw = pyo.Param(model.steps, mutable=True, initialize=0.0)
         model.offtake_price = pyo.Param(model.steps, mutable=True, initialize=0.0)
         model.injection_price = pyo.Param(model.steps, mutable=True, initialize=0.0)
+        model.current_month_step = pyo.Param(
+            model.steps, mutable=True, within=pyo.Binary, initialize=0
+        )
         model.initial_energy = pyo.Param(mutable=True, initialize=0.0)
         model.past_month_peak = pyo.Param(mutable=True, initialize=0.0)
         model.charge = pyo.Var(
@@ -185,7 +188,9 @@ class Optimizer:
         )
         model.horizon_peak_limit = pyo.Constraint(
             model.steps,
-            rule=lambda m, step: m.planned_peak >= m.grid_import[step],
+            rule=lambda m, step: m.planned_peak
+            >= m.grid_import[step]
+            - self.specs.offtake_limit_kw * (1 - m.current_month_step[step]),
         )
         if negative_steps:
             model.negative_steps = pyo.Set(initialize=negative_steps)
@@ -309,10 +314,16 @@ class Optimizer:
             model.net_kw[step] = 0.0
             model.offtake_price[step] = 0.0
             model.injection_price[step] = 0.0
+            model.current_month_step[step] = 0
         for step in range(len(forecast)):
             model.net_kw[step] = net[step]
             model.offtake_price[step] = offtake_price[step]
             model.injection_price[step] = injection_price[step]
+            timestamp = forecast.index[step]
+            model.current_month_step[step] = int(
+                timestamp.year == context.at_time.year
+                and timestamp.month == context.at_time.month
+            )
         model.initial_energy.set_value(initial_energy)
         model.past_month_peak.set_value(past_month_peak)
 
