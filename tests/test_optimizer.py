@@ -242,12 +242,14 @@ def test_unpublished_prices_are_not_invented(specs: SiteSpecs) -> None:
 def test_non_negative_prices_reuse_continuous_model(specs: SiteSpecs) -> None:
     optimizer = Optimizer(specs)
     model = optimizer.model
+    solver = optimizer.lp_solver
     forecast, prices = _inputs([0.0], [50.0], [10.0])
 
     optimizer.solve(forecast, prices, _context(forecast.index, 0.5))
     optimizer.solve(forecast, prices, _context(forecast.index, 0.6))
 
     assert optimizer.model is model
+    assert optimizer.lp_solver is solver
     assert not hasattr(model, "charge_mode")
     assert not any(
         variable.is_binary()
@@ -261,6 +263,7 @@ def test_negative_price_builds_milp_only_for_negative_steps(
 ) -> None:
     optimizer = Optimizer(specs, enforce_negative_price_exclusivity=True)
     reusable_model = optimizer.model
+    milp_solver = optimizer.milp_solver
     built_models: list[pyo.ConcreteModel] = []
     original_build_model = optimizer._build_model
 
@@ -284,6 +287,7 @@ def test_negative_price_builds_milp_only_for_negative_steps(
     temporary_model = built_models[0]
     assert optimizer.enforce_negative_price_exclusivity is True
     assert optimizer.model is reusable_model
+    assert optimizer.milp_solver is milp_solver
     assert list(temporary_model.negative_steps) == [1]
     assert list(temporary_model.charge_mode) == [1]
     assert list(temporary_model.charge_exclusive) == [1]

@@ -69,8 +69,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pyomo.environ as pyo
-from pyomo.contrib.solver.common.util import NoFeasibleSolutionError
-from pyomo.opt import TerminationCondition
+from pyomo.contrib.appsi.base import TerminationCondition
+from pyomo.contrib.appsi.solvers import Highs
 
 from pipeline.data import HOURS_PER_STEP
 from pipeline.harness import DecisionContext
@@ -132,6 +132,10 @@ class Optimizer:
         )
         self.last_summary: dict[str, float | int | str] = {}
         self.model = self._build_model(self.MAX_HORIZON)
+        self.lp_solver = Highs()
+        self.milp_solver = Highs()
+        self.lp_solver.config.load_solution = False
+        self.milp_solver.config.load_solution = False
 
     def _build_model(
         self,
@@ -327,13 +331,12 @@ class Optimizer:
         model.initial_energy.set_value(initial_energy)
         model.past_month_peak.set_value(past_month_peak)
 
-        try:
-            result = pyo.SolverFactory("highs").solve(model)
-        except NoFeasibleSolutionError as error:
-            raise RuntimeError("Battery optimization failed: infeasible") from error
-        termination = result.solver.termination_condition
+        solver = self.milp_solver if use_milp else self.lp_solver
+        result = solver.solve(model)
+        termination = result.termination_condition
         if termination != TerminationCondition.optimal:
             raise RuntimeError(f"Battery optimization failed: {termination}")
+        result.solution_loader.load_vars()
 
         active_steps = range(len(forecast))
         charge = np.array([pyo.value(model.charge[t]) for t in active_steps])
@@ -342,7 +345,7 @@ class Optimizer:
         planned_peak = float(pyo.value(model.planned_peak))
 
         self.last_summary = {
-            "solver_termination": str(termination),
+            "solver_termination": termination.name,
             "solver_mode": "milp" if use_milp else "lp",
             "objective_eur": float(pyo.value(model.objective)),
             "energy_cost_eur": float(pyo.value(model.energy_cost)),
