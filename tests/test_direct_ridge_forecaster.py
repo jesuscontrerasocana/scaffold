@@ -69,7 +69,7 @@ def test_prediction_is_direct_and_ignores_future_actuals(specs: SiteSpecs) -> No
     expected = forecaster.predict(at_time, safe_history, future, 132)
     actual = forecaster.predict(at_time, oversized, future, 132)
     later_before = actual.iloc[1:].copy()
-    forecaster.model.models[0].intercept_ += 1_000_000
+    forecaster.model.inference_intercepts[0] += 1_000_000
     changed = forecaster.predict(at_time, safe_history, future, 132)
 
     pd.testing.assert_frame_equal(actual, expected)
