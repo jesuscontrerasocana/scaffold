@@ -2,4 +2,5 @@ models/
 *.egg-info/
 *__pycache__*
 out/
+output/
 octave_forecasting_models_and_experiments.md

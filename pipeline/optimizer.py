@@ -68,12 +68,14 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pyomo.environ as pyo
+from pyomo.contrib.solver.common.util import NoFeasibleSolutionError
+from pyomo.opt import TerminationCondition
 
+from pipeline.data import HOURS_PER_STEP
 from pipeline.harness import DecisionContext
 from pipeline.specs import SiteSpecs
-
-
-class Optimizer:
+class ScaffoldOptimizer:
     """BASELINE — replace me. Charge when power is cheap, discharge when it is dear."""
 
     CHEAP_QUANTILE = 0.25
@@ -107,5 +109,235 @@ class Optimizer:
             discharge[discharging] = self.specs.battery.discharge_power_kw
         return pd.DataFrame(
             {"battery_charge_kw": charge, "battery_discharge_kw": discharge},
+            index=forecast.index,
+        )
+
+class Optimizer:
+    """Minimize energy and battery degradation cost over the forecast horizon.
+
+    Positive ``net_kw`` is site consumption. Charging increases grid demand and
+    discharging reduces it, so import - export = net + charge - discharge.
+    """
+
+    MAX_HORIZON = 132
+
+    def __init__(
+        self,
+        specs: SiteSpecs,
+        enforce_negative_price_exclusivity: bool = True,
+    ) -> None:
+        self.specs = specs
+        self.enforce_negative_price_exclusivity = (
+            enforce_negative_price_exclusivity
+        )
+        self.last_summary: dict[str, float | int | str] = {}
+        self.model = self._build_model(self.MAX_HORIZON)
+
+    def _build_model(
+        self,
+        horizon_steps: int,
+        *,
+        negative_steps: list[int] | None = None,
+    ) -> pyo.ConcreteModel:
+        battery = self.specs.battery
+        eta = battery.one_way_efficiency
+        minimum_energy = battery.capacity_kwh * battery.min_soc
+        maximum_energy = battery.capacity_kwh * battery.max_soc
+
+        model = pyo.ConcreteModel()
+        model.steps = pyo.RangeSet(0, horizon_steps - 1)
+        model.net_kw = pyo.Param(model.steps, mutable=True, initialize=0.0)
+        model.offtake_price = pyo.Param(model.steps, mutable=True, initialize=0.0)
+        model.injection_price = pyo.Param(model.steps, mutable=True, initialize=0.0)
+        model.initial_energy = pyo.Param(mutable=True, initialize=0.0)
+        model.charge = pyo.Var(
+            model.steps, bounds=(0.0, battery.charge_power_kw)
+        )
+        model.discharge = pyo.Var(
+            model.steps, bounds=(0.0, battery.discharge_power_kw)
+        )
+        model.energy = pyo.Var(
+            model.steps, bounds=(minimum_energy, maximum_energy)
+        )
+        model.grid_import = pyo.Var(
+            model.steps, bounds=(0.0, self.specs.offtake_limit_kw)
+        )
+        model.grid_export = pyo.Var(
+            model.steps, bounds=(0.0, self.specs.injection_limit_kw)
+        )
+
+        def energy_balance(m: pyo.ConcreteModel, step: int) -> pyo.Constraint:
+            previous = m.initial_energy if step == 0 else m.energy[step - 1]
+            return m.energy[step] == previous + HOURS_PER_STEP * (
+                eta * m.charge[step] - m.discharge[step] / eta
+            )
+
+        model.energy_balance = pyo.Constraint(model.steps, rule=energy_balance)
+        model.grid_balance = pyo.Constraint(
+            model.steps,
+            rule=lambda m, step: m.grid_import[step] - m.grid_export[step]
+            == m.net_kw[step] + m.charge[step] - m.discharge[step],
+        )
+        if negative_steps:
+            model.negative_steps = pyo.Set(initialize=negative_steps)
+            model.charge_mode = pyo.Var(model.negative_steps, domain=pyo.Binary)
+            model.charge_exclusive = pyo.Constraint(
+                model.negative_steps,
+                rule=lambda m, step: m.charge[step]
+                <= battery.charge_power_kw * m.charge_mode[step],
+            )
+            model.discharge_exclusive = pyo.Constraint(
+                model.negative_steps,
+                rule=lambda m, step: m.discharge[step]
+                <= battery.discharge_power_kw * (1 - m.charge_mode[step]),
+            )
+
+        degradation_per_internal_kwh = battery.cycle_cost_eur / (
+            2 * battery.usable_capacity_kwh
+        )
+        model.energy_cost = pyo.Expression(
+            expr=sum(
+                HOURS_PER_STEP
+                / 1000
+                * (
+                    model.grid_import[step] * model.offtake_price[step]
+                    - model.grid_export[step] * model.injection_price[step]
+                )
+                for step in model.steps
+            )
+        )
+        model.degradation_cost = pyo.Expression(
+            expr=sum(
+                HOURS_PER_STEP
+                * degradation_per_internal_kwh
+                * (
+                    eta * model.charge[step]
+                    + model.discharge[step] / eta
+                )
+                for step in model.steps
+            )
+        )
+        model.objective = pyo.Objective(
+            expr=model.energy_cost + model.degradation_cost,
+            sense=pyo.minimize,
+        )
+        return model
+
+    def solve(
+        self,
+        forecast: pd.DataFrame,
+        prices: pd.DataFrame,
+        context: DecisionContext,
+    ) -> pd.DataFrame:
+        if not forecast.index.equals(prices.index):
+            raise ValueError("Forecast and price indexes must match")
+        if "net_kw" not in forecast or not {
+            "offtake_price_eur_per_mwh",
+            "injection_price_eur_per_mwh",
+        } <= set(prices.columns):
+            raise ValueError("Forecast or prices are missing required columns")
+        if len(forecast) == 0:
+            self.last_summary = {
+                "solver_termination": "empty horizon",
+                "solver_mode": "lp",
+                "negative_price_exclusivity_enabled": (
+                    self.enforce_negative_price_exclusivity
+                ),
+            }
+            return pd.DataFrame(
+                columns=["battery_charge_kw", "battery_discharge_kw"],
+                index=forecast.index,
+                dtype=float,
+            )
+        if len(forecast) > self.MAX_HORIZON:
+            raise ValueError(f"Forecast horizon cannot exceed {self.MAX_HORIZON} steps")
+
+        net = pd.to_numeric(forecast["net_kw"], errors="coerce").to_numpy()
+        if not np.isfinite(net).all():
+            raise ValueError("Forecast net_kw must contain only finite values")
+
+        offtake_price = pd.to_numeric(
+            prices["offtake_price_eur_per_mwh"], errors="coerce"
+        ).to_numpy(dtype=float)
+        injection_price = pd.to_numeric(
+            prices["injection_price_eur_per_mwh"], errors="coerce"
+        ).to_numpy(dtype=float)
+        published = np.isfinite(offtake_price) & np.isfinite(injection_price)
+        # The unpublished tail has no assumed energy value. It remains in the model so
+        # battery physics and grid limits are still enforced without inventing prices.
+        offtake_price = np.where(published, offtake_price, 0.0)
+        injection_price = np.where(published, injection_price, 0.0)
+        negative_steps = [
+            step
+            for step in range(len(forecast))
+            if published[step] and injection_price[step] < 0
+        ]
+        use_milp = self.enforce_negative_price_exclusivity and bool(negative_steps)
+
+        battery = self.specs.battery
+        eta = battery.one_way_efficiency
+        minimum_energy = battery.capacity_kwh * battery.min_soc
+        maximum_energy = battery.capacity_kwh * battery.max_soc
+        initial_energy = battery.capacity_kwh * context.initial_soc
+        if not minimum_energy <= initial_energy <= maximum_energy:
+            raise ValueError("Initial state of charge is outside battery bounds")
+
+        model = (
+            self._build_model(len(forecast), negative_steps=negative_steps)
+            if use_milp
+            else self.model
+        )
+        for step in model.steps:
+            model.net_kw[step] = 0.0
+            model.offtake_price[step] = 0.0
+            model.injection_price[step] = 0.0
+        for step in range(len(forecast)):
+            model.net_kw[step] = net[step]
+            model.offtake_price[step] = offtake_price[step]
+            model.injection_price[step] = injection_price[step]
+        model.initial_energy.set_value(initial_energy)
+
+        try:
+            result = pyo.SolverFactory("highs").solve(model)
+        except NoFeasibleSolutionError as error:
+            raise RuntimeError("Battery optimization failed: infeasible") from error
+        termination = result.solver.termination_condition
+        if termination != TerminationCondition.optimal:
+            raise RuntimeError(f"Battery optimization failed: {termination}")
+
+        active_steps = range(len(forecast))
+        charge = np.array([pyo.value(model.charge[t]) for t in active_steps])
+        discharge = np.array([pyo.value(model.discharge[t]) for t in active_steps])
+        energy = np.array([pyo.value(model.energy[t]) for t in active_steps])
+        grid_import = np.array([pyo.value(model.grid_import[t]) for t in active_steps])
+        grid_export = np.array([pyo.value(model.grid_export[t]) for t in active_steps])
+
+        self.last_summary = {
+            "solver_termination": str(termination),
+            "solver_mode": "milp" if use_milp else "lp",
+            "negative_price_exclusivity_enabled": (
+                self.enforce_negative_price_exclusivity
+            ),
+            "objective_eur": float(pyo.value(model.objective)),
+            "energy_cost_eur": float(pyo.value(model.energy_cost)),
+            "injection_value_eur": float(
+                HOURS_PER_STEP / 1000 * np.sum(grid_export * injection_price)
+            ),
+            "degradation_cost_eur": float(pyo.value(model.degradation_cost)),
+            "total_import_kwh": float(HOURS_PER_STEP * grid_import.sum()),
+            "total_export_kwh": float(HOURS_PER_STEP * grid_export.sum()),
+            "published_price_steps": int(published.sum()),
+            "initial_soc": float(context.initial_soc),
+            "final_soc": float(energy[-1] / battery.capacity_kwh),
+            "minimum_soc": float(energy.min() / battery.capacity_kwh),
+            "maximum_soc": float(energy.max() / battery.capacity_kwh),
+            "maximum_charge_kw": float(charge.max()),
+            "maximum_discharge_kw": float(discharge.max()),
+        }
+        return pd.DataFrame(
+            {
+                "battery_charge_kw": charge,
+                "battery_discharge_kw": discharge,
+            },
             index=forecast.index,
         )
