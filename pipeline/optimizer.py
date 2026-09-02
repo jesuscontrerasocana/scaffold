@@ -75,7 +75,42 @@ from pyomo.opt import TerminationCondition
 from pipeline.data import HOURS_PER_STEP
 from pipeline.harness import DecisionContext
 from pipeline.specs import SiteSpecs
+class ScaffoldOptimizer:
+    """BASELINE — replace me. Charge when power is cheap, discharge when it is dear."""
 
+    CHEAP_QUANTILE = 0.25
+    DEAR_QUANTILE = 0.75
+
+    def __init__(self, specs: SiteSpecs) -> None:
+        self.specs = specs
+
+    def solve(
+        self,
+        forecast: pd.DataFrame,
+        prices: pd.DataFrame,
+        context: DecisionContext,
+    ) -> pd.DataFrame:
+        price = prices["offtake_price_eur_per_mwh"].to_numpy()
+        published = ~np.isnan(price)  # prices past the day-ahead edge arrive as NaN
+
+        # Act only where prices are published and idle through the unpriced tail -- the
+        # simplest thing that respects the day-ahead rule.
+        charge = np.zeros(len(price))
+        discharge = np.zeros(len(price))
+        if published.any():
+            cheap, dear = np.quantile(
+                price[published], [self.CHEAP_QUANTILE, self.DEAR_QUANTILE]
+            )
+            charging = published & (price <= cheap)
+            discharging = (
+                published & (price >= dear) & ~charging
+            )  # flat prices satisfy both
+            charge[charging] = self.specs.battery.charge_power_kw
+            discharge[discharging] = self.specs.battery.discharge_power_kw
+        return pd.DataFrame(
+            {"battery_charge_kw": charge, "battery_discharge_kw": discharge},
+            index=forecast.index,
+        )
 
 class Optimizer:
     """Minimize energy and battery degradation cost over the forecast horizon.
