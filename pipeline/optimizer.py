@@ -84,9 +84,84 @@ class Optimizer:
     discharging reduces it, so import - export = net + charge - discharge.
     """
 
+    MAX_HORIZON = 132
+
     def __init__(self, specs: SiteSpecs) -> None:
         self.specs = specs
         self.last_summary: dict[str, float | int | str] = {}
+        self.model = self._build_model()
+
+    def _build_model(self) -> pyo.ConcreteModel:
+        battery = self.specs.battery
+        eta = battery.one_way_efficiency
+        minimum_energy = battery.capacity_kwh * battery.min_soc
+        maximum_energy = battery.capacity_kwh * battery.max_soc
+
+        model = pyo.ConcreteModel()
+        model.steps = pyo.RangeSet(0, self.MAX_HORIZON - 1)
+        model.net_kw = pyo.Param(model.steps, mutable=True, initialize=0.0)
+        model.offtake_price = pyo.Param(model.steps, mutable=True, initialize=0.0)
+        model.injection_price = pyo.Param(model.steps, mutable=True, initialize=0.0)
+        model.initial_energy = pyo.Param(mutable=True, initialize=0.0)
+        model.charge = pyo.Var(
+            model.steps, bounds=(0.0, battery.charge_power_kw)
+        )
+        model.discharge = pyo.Var(
+            model.steps, bounds=(0.0, battery.discharge_power_kw)
+        )
+        model.energy = pyo.Var(
+            model.steps, bounds=(minimum_energy, maximum_energy)
+        )
+        model.grid_import = pyo.Var(
+            model.steps, bounds=(0.0, self.specs.offtake_limit_kw)
+        )
+        model.grid_export = pyo.Var(
+            model.steps, bounds=(0.0, self.specs.injection_limit_kw)
+        )
+
+        def energy_balance(m: pyo.ConcreteModel, step: int) -> pyo.Constraint:
+            previous = m.initial_energy if step == 0 else m.energy[step - 1]
+            return m.energy[step] == previous + HOURS_PER_STEP * (
+                eta * m.charge[step] - m.discharge[step] / eta
+            )
+
+        model.energy_balance = pyo.Constraint(model.steps, rule=energy_balance)
+        model.grid_balance = pyo.Constraint(
+            model.steps,
+            rule=lambda m, step: m.grid_import[step] - m.grid_export[step]
+            == m.net_kw[step] + m.charge[step] - m.discharge[step],
+        )
+
+        degradation_per_internal_kwh = battery.cycle_cost_eur / (
+            2 * battery.usable_capacity_kwh
+        )
+        model.energy_cost = pyo.Expression(
+            expr=sum(
+                HOURS_PER_STEP
+                / 1000
+                * (
+                    model.grid_import[step] * model.offtake_price[step]
+                    - model.grid_export[step] * model.injection_price[step]
+                )
+                for step in model.steps
+            )
+        )
+        model.degradation_cost = pyo.Expression(
+            expr=sum(
+                HOURS_PER_STEP
+                * degradation_per_internal_kwh
+                * (
+                    eta * model.charge[step]
+                    + model.discharge[step] / eta
+                )
+                for step in model.steps
+            )
+        )
+        model.objective = pyo.Objective(
+            expr=model.energy_cost + model.degradation_cost,
+            sense=pyo.minimize,
+        )
+        return model
 
     def solve(
         self,
@@ -108,6 +183,8 @@ class Optimizer:
                 index=forecast.index,
                 dtype=float,
             )
+        if len(forecast) > self.MAX_HORIZON:
+            raise ValueError(f"Forecast horizon cannot exceed {self.MAX_HORIZON} steps")
 
         net = pd.to_numeric(forecast["net_kw"], errors="coerce").to_numpy()
         if not np.isfinite(net).all():
@@ -133,66 +210,16 @@ class Optimizer:
         if not minimum_energy <= initial_energy <= maximum_energy:
             raise ValueError("Initial state of charge is outside battery bounds")
 
-        model = pyo.ConcreteModel()
-        model.steps = pyo.RangeSet(0, len(forecast) - 1)
-        model.charge = pyo.Var(
-            model.steps, bounds=(0.0, battery.charge_power_kw)
-        )
-        model.discharge = pyo.Var(
-            model.steps, bounds=(0.0, battery.discharge_power_kw)
-        )
-        model.energy = pyo.Var(
-            model.steps, bounds=(minimum_energy, maximum_energy)
-        )
-        model.grid_import = pyo.Var(
-            model.steps, bounds=(0.0, self.specs.offtake_limit_kw)
-        )
-        model.grid_export = pyo.Var(
-            model.steps, bounds=(0.0, self.specs.injection_limit_kw)
-        )
-
-        def energy_balance(m: pyo.ConcreteModel, step: int) -> pyo.Constraint:
-            previous = initial_energy if step == 0 else m.energy[step - 1]
-            return m.energy[step] == previous + HOURS_PER_STEP * (
-                eta * m.charge[step] - m.discharge[step] / eta
-            )
-
-        model.energy_balance = pyo.Constraint(model.steps, rule=energy_balance)
-        model.grid_balance = pyo.Constraint(
-            model.steps,
-            rule=lambda m, step: m.grid_import[step] - m.grid_export[step]
-            == net[step] + m.charge[step] - m.discharge[step],
-        )
-
-        degradation_per_internal_kwh = battery.cycle_cost_eur / (
-            2 * battery.usable_capacity_kwh
-        )
-        model.energy_cost = pyo.Expression(
-            expr=sum(
-                HOURS_PER_STEP
-                / 1000
-                * (
-                    model.grid_import[step] * offtake_price[step]
-                    - model.grid_export[step] * injection_price[step]
-                )
-                for step in model.steps
-            )
-        )
-        model.degradation_cost = pyo.Expression(
-            expr=sum(
-                HOURS_PER_STEP
-                * degradation_per_internal_kwh
-                * (
-                    eta * model.charge[step]
-                    + model.discharge[step] / eta
-                )
-                for step in model.steps
-            )
-        )
-        model.objective = pyo.Objective(
-            expr=model.energy_cost + model.degradation_cost,
-            sense=pyo.minimize,
-        )
+        model = self.model
+        for step in model.steps:
+            model.net_kw[step] = 0.0
+            model.offtake_price[step] = 0.0
+            model.injection_price[step] = 0.0
+        for step in range(len(forecast)):
+            model.net_kw[step] = net[step]
+            model.offtake_price[step] = offtake_price[step]
+            model.injection_price[step] = injection_price[step]
+        model.initial_energy.set_value(initial_energy)
 
         try:
             result = pyo.SolverFactory("highs").solve(model)
@@ -202,11 +229,12 @@ class Optimizer:
         if termination != TerminationCondition.optimal:
             raise RuntimeError(f"Battery optimization failed: {termination}")
 
-        charge = np.array([pyo.value(model.charge[t]) for t in model.steps])
-        discharge = np.array([pyo.value(model.discharge[t]) for t in model.steps])
-        energy = np.array([pyo.value(model.energy[t]) for t in model.steps])
-        grid_import = np.array([pyo.value(model.grid_import[t]) for t in model.steps])
-        grid_export = np.array([pyo.value(model.grid_export[t]) for t in model.steps])
+        active_steps = range(len(forecast))
+        charge = np.array([pyo.value(model.charge[t]) for t in active_steps])
+        discharge = np.array([pyo.value(model.discharge[t]) for t in active_steps])
+        energy = np.array([pyo.value(model.energy[t]) for t in active_steps])
+        grid_import = np.array([pyo.value(model.grid_import[t]) for t in active_steps])
+        grid_export = np.array([pyo.value(model.grid_export[t]) for t in active_steps])
 
         self.last_summary = {
             "solver_termination": str(termination),
