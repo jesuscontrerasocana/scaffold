@@ -194,12 +194,11 @@ def test_negative_pv_is_clipped_before_recombination(trained) -> None:  # noqa: 
     forecaster, history, _ = trained
     at_time = history.index[-1] + pd.Timedelta(minutes=15)
     future = _future(at_time)
-    original_intercepts = [model.intercept_ for model in forecaster.model.pv_models]
-    original_coefficients = [model.coef_.copy() for model in forecaster.model.pv_models]
+    original_weights = forecaster.model.pv_inference_weights.copy()
+    original_intercepts = forecaster.model.pv_inference_intercepts.copy()
     try:
-        for model in forecaster.model.pv_models:
-            model.coef_[:] = 0
-            model.intercept_ = -100.0
+        forecaster.model.pv_inference_weights[:] = 0.0
+        forecaster.model.pv_inference_intercepts[:] = -100.0
         load, pv = forecaster.model._predict_components(
             history, future, future.index, at_time
         )
@@ -207,14 +206,42 @@ def test_negative_pv_is_clipped_before_recombination(trained) -> None:  # noqa: 
         assert (pv == 0).all()
         pd.testing.assert_series_equal(prediction["net_kw"], load, check_names=False)
     finally:
-        for model, intercept, coefficients in zip(
-            forecaster.model.pv_models,
-            original_intercepts,
-            original_coefficients,
-            strict=True,
-        ):
-            model.intercept_ = intercept
-            model.coef_ = coefficients
+        forecaster.model.pv_inference_weights = original_weights
+        forecaster.model.pv_inference_intercepts = original_intercepts
+
+
+def test_precomputed_parameters_match_sklearn_for_every_lead(trained) -> None:  # noqa: ANN001
+    model = trained[0].model
+    rng = np.random.default_rng(42)
+
+    for scalers, models, weights, intercepts, feature_names in (
+        (
+            model.load_scalers,
+            model.load_models,
+            model.load_inference_weights,
+            model.load_inference_intercepts,
+            model.LOAD_FEATURE_NAMES,
+        ),
+        (
+            model.pv_scalers,
+            model.pv_models,
+            model.pv_inference_weights,
+            model.pv_inference_intercepts,
+            model.PV_FEATURE_NAMES,
+        ),
+    ):
+        features = rng.normal(size=(model.MAX_HORIZON, len(feature_names)))
+        expected = np.array(
+            [
+                ridge.predict(
+                    scaler.transform(pd.DataFrame([row], columns=feature_names))
+                )[0]
+                for row, scaler, ridge in zip(features, scalers, models, strict=True)
+            ]
+        )
+        actual = np.sum(features * weights, axis=1) + intercepts
+
+        np.testing.assert_allclose(actual, expected, atol=1e-10, rtol=0)
 
 
 def test_save_load_and_metadata(trained, tmp_path) -> None:  # noqa: ANN001
