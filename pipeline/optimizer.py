@@ -100,31 +100,33 @@ def _fill_unpublished_prices(
     for target_day in filled.index.normalize().unique():
         target_is_weekend = target_day.weekday() >= 5
         earliest_day = safe_history.index[0].normalize()
-        reference_day = target_day - pd.DateOffset(days=1)
-        reference_prices = pd.DataFrame()
-
-        while reference_day >= earliest_day:
-            if (reference_day.weekday() >= 5) == target_is_weekend:
-                next_day = reference_day + pd.DateOffset(days=1)
-                candidate_prices = safe_history.loc[
-                    reference_day : next_day - pd.Timedelta(nanoseconds=1),
-                    available_columns,
-                ].apply(pd.to_numeric, errors="coerce")
-                if candidate_prices.notna().any().any():
-                    reference_prices = candidate_prices
-                    break
-            reference_day -= pd.DateOffset(days=1)
-
-        if reference_prices.empty:
-            continue
-
-        references.add(str(reference_day.date()))
         target_timestamps = filled.index[filled.index.normalize() == target_day]
 
         for column in available_columns:
+            reference_day = target_day - pd.DateOffset(days=1)
+            reference_prices = pd.Series(dtype=float)
+            while reference_day >= earliest_day:
+                if (reference_day.weekday() >= 5) == target_is_weekend:
+                    next_day = reference_day + pd.DateOffset(days=1)
+                    candidate_prices = pd.to_numeric(
+                        safe_history.loc[
+                            reference_day : next_day - pd.Timedelta(nanoseconds=1),
+                            column,
+                        ],
+                        errors="coerce",
+                    )
+                    if candidate_prices.notna().any():
+                        reference_prices = candidate_prices
+                        break
+                reference_day -= pd.DateOffset(days=1)
+
+            if reference_prices.empty:
+                continue
+
+            references.add(str(reference_day.date()))
             values_by_slot = {
                 (timestamp.hour, timestamp.minute): value
-                for timestamp, value in reference_prices[column].items()
+                for timestamp, value in reference_prices.items()
                 if pd.notna(value)
             }
             for timestamp in target_timestamps:
