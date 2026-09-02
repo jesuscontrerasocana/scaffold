@@ -11,6 +11,7 @@ dependencies = [
     "highspy>=1.7",       # MILP solver reachable from cvxpy as solver="HIGHS"
     "scikit-learn>=1.4",
     "matplotlib>=3.8",
+    "pyomo>=6.10",
 ]
 
 [project.optional-dependencies]
