@@ -104,6 +104,7 @@ def test_load_and_pv_feature_semantics() -> None:
         pv_recent, data["most_recent_load_factor_forecast"], 5
     )
     pv_target = decisions[0] + 4 * pd.Timedelta(minutes=15)
+    pv_target_slot = pv_target.hour * 4 + pv_target.minute // 15
 
     assert load_recent.iloc[0]["load_lag_15min"] == load.at[
         decisions[0] - pd.Timedelta(minutes=15)
@@ -117,6 +118,16 @@ def test_load_and_pv_feature_semantics() -> None:
     assert pv_features.iloc[0]["most_recent_load_factor_forecast"] == data.at[
         pv_target, "most_recent_load_factor_forecast"
     ]
+    assert pv_features.iloc[0]["time_of_day_sin"] == pytest.approx(
+        np.sin(2 * np.pi * pv_target_slot / 96)
+    )
+    assert pv_features.iloc[0]["time_of_day_cos"] == pytest.approx(
+        np.cos(2 * np.pi * pv_target_slot / 96)
+    )
+    decision_slot = decisions[0].hour * 4 + decisions[0].minute // 15
+    assert pv_features.iloc[0]["time_of_day_sin"] != pytest.approx(
+        np.sin(2 * np.pi * decision_slot / 96)
+    )
 
 
 def test_negative_pv_is_clipped_before_recombination(trained) -> None:  # noqa: ANN001
@@ -161,9 +172,13 @@ def test_save_load_and_metadata(trained, tmp_path) -> None:  # noqa: ANN001
     assert state["load"]["feature_names"] == list(
         DecomposedRidgeNetLoadModel.LOAD_FEATURE_NAMES
     )
-    assert state["pv"]["feature_names"] == list(
-        DecomposedRidgeNetLoadModel.PV_FEATURE_NAMES
-    )
+    assert state["pv"]["feature_names"] == [
+        "pv_lag_15min",
+        "pv_lag_1h",
+        "most_recent_load_factor_forecast",
+        "time_of_day_sin",
+        "time_of_day_cos",
+    ]
     assert state["pv"]["prediction_clip_min_kw"] == 0.0
     assert len(state["load"]["lead_models"]) == 132
     assert len(state["pv"]["lead_models"]) == 132

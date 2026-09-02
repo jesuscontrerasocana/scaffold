@@ -623,6 +623,8 @@ class DecomposedRidgeNetLoadModel:
         "pv_lag_15min",
         "pv_lag_1h",
         EXOG_FEATURE,
+        "time_of_day_sin",
+        "time_of_day_cos",
     )
 
     def __init__(self) -> None:
@@ -701,7 +703,11 @@ class DecomposedRidgeNetLoadModel:
     ) -> pd.DataFrame:
         decisions = decision_features.index
         targets = decisions + (lead_steps - 1) * STEP
-        features = decision_features.copy()
+        calendar = DirectRidgeNetLoadModel._target_calendar(targets).loc[
+            :, ["time_of_day_sin", "time_of_day_cos"]
+        ]
+        calendar.index = decisions
+        features = decision_features.join(calendar)
         features[cls.EXOG_FEATURE] = pd.to_numeric(
             exog.reindex(targets), errors="coerce"
         ).to_numpy(dtype=float)
@@ -728,7 +734,11 @@ class DecomposedRidgeNetLoadModel:
         self.load_fill_values = {
             name: float(load_fill[name].median()) for name in self.LOAD_FEATURE_NAMES
         }
-        pv_fill = pv_decision.copy()
+        pv_fill = pv_decision.join(
+            DirectRidgeNetLoadModel._target_calendar(decisions).loc[
+                :, ["time_of_day_sin", "time_of_day_cos"]
+            ]
+        )
         pv_fill[self.EXOG_FEATURE] = exog
         self.pv_fill_values = {
             name: float(pv_fill[name].median()) for name in self.PV_FEATURE_NAMES
@@ -811,7 +821,9 @@ class DecomposedRidgeNetLoadModel:
         pv_recent = self._pv_decision_features(
             pv, pd.DatetimeIndex([at_time])
         ).iloc[0]
-        pv_features = pd.DataFrame(index=index)
+        pv_features = DirectRidgeNetLoadModel._target_calendar(index).loc[
+            :, ["time_of_day_sin", "time_of_day_cos"]
+        ]
         for name, value in pv_recent.items():
             pv_features[name] = value
         pv_features[self.EXOG_FEATURE] = pd.to_numeric(
