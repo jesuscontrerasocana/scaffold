@@ -10,6 +10,7 @@ from pipeline.forecaster import (
     DecomposedRidgeNetLoadModel,
     DirectRidgeNetLoadModel,
     Forecaster,
+    RidgeHgbrDecomposedNetLoadModel,
     _predict_ridge_leads,
     build_lag_features,
 )
@@ -311,3 +312,121 @@ def test_prediction_skips_generic_history_feature_builders(
     )
 
     forecaster.predict(at_time, history, _future(at_time), 132)
+
+
+@pytest.fixture(scope="module")
+def hgbr_trained() -> tuple[Forecaster, pd.DataFrame, SiteSpecs]:
+    specs = SiteSpecs.from_yaml("site.yaml")
+    history = _data()
+    history.iloc[100, history.columns.get_loc("pv_production_kw")] = np.nan
+    forecaster = Forecaster(specs, model_name=Forecaster.RIDGE_HGBR_DECOMPOSED)
+    forecaster.fit(history)
+    return forecaster, history, specs
+
+
+def test_hgbr_model_selection_preserves_ridge_decomposed_option(
+    trained,
+) -> None:  # noqa: ANN001
+    specs = trained[2]
+    ridge = Forecaster(specs, model_name=Forecaster.RIDGE_DECOMPOSED)
+    hgbr = Forecaster(specs, model_name=Forecaster.RIDGE_HGBR_DECOMPOSED)
+
+    assert type(ridge.model) is DecomposedRidgeNetLoadModel
+    assert type(hgbr.model) is RidgeHgbrDecomposedNetLoadModel
+
+
+def test_hgbr_full_horizon_output_and_load_models(
+    trained, hgbr_trained
+) -> None:  # noqa: ANN001
+    ridge, history, _ = trained
+    hgbr, _, _ = hgbr_trained
+    at_time = history.index[-1] + pd.Timedelta(minutes=15)
+    future = _future(at_time)
+
+    prediction = hgbr.predict(at_time, history, future, 132)
+
+    assert prediction.index.equals(future.index)
+    assert prediction.columns.tolist() == ["net_kw", "load_kw", "pv_kw"]
+    assert len(prediction) == 132
+    assert np.isfinite(prediction).all().all()
+    assert (prediction["pv_kw"] >= 0).all()
+    assert hgbr.model.pv_model is not None
+    assert hgbr.model.pv_models == []
+    for ridge_model, hgbr_load_model in zip(
+        ridge.model.load_models, hgbr.model.load_models, strict=True
+    ):
+        np.testing.assert_allclose(ridge_model.coef_, hgbr_load_model.coef_)
+        assert ridge_model.intercept_ == pytest.approx(hgbr_load_model.intercept_)
+
+
+def test_hgbr_ignores_future_history(hgbr_trained) -> None:  # noqa: ANN001
+    forecaster, data, _ = hgbr_trained
+    at_time = data.index[-132]
+    future = _future(at_time)
+    safe = data.loc[data.index < at_time]
+    oversized = data.copy()
+    oversized.loc[
+        oversized.index >= at_time, ["grid_net_kw", "pv_production_kw"]
+    ] = 1_000_000
+
+    expected = forecaster.predict(at_time, safe, future, 132)
+    actual = forecaster.predict(at_time, oversized, future, 132)
+
+    pd.testing.assert_frame_equal(actual, expected)
+
+
+def test_hgbr_clips_negative_pv_predictions(
+    hgbr_trained, monkeypatch: pytest.MonkeyPatch
+) -> None:  # noqa: ANN001
+    forecaster, history, _ = hgbr_trained
+    at_time = history.index[-1] + pd.Timedelta(minutes=15)
+    future = _future(at_time)
+
+    monkeypatch.setattr(
+        forecaster.model.pv_model,
+        "predict",
+        lambda features: -np.ones(len(features)),
+    )
+
+    prediction = forecaster.predict(at_time, history, future, 132)
+
+    assert (prediction["pv_kw"] == 0).all()
+    pd.testing.assert_series_equal(
+        prediction["net_kw"], prediction["load_kw"], check_names=False
+    )
+
+
+def test_hgbr_predicts_full_horizon_once_with_lead_feature(
+    hgbr_trained, monkeypatch: pytest.MonkeyPatch
+) -> None:  # noqa: ANN001
+    forecaster, history, _ = hgbr_trained
+    at_time = history.index[-1] + pd.Timedelta(minutes=15)
+    future = _future(at_time)
+    calls: list[pd.DataFrame] = []
+    original_predict = forecaster.model.pv_model.predict
+
+    def record_predict(features: pd.DataFrame) -> np.ndarray:
+        calls.append(features.copy())
+        return original_predict(features)
+
+    monkeypatch.setattr(forecaster.model.pv_model, "predict", record_predict)
+
+    forecaster.predict(at_time, history, future, 132)
+
+    assert len(calls) == 1
+    assert len(calls[0]) == 132
+    assert calls[0]["lead_steps"].tolist() == list(range(1, 133))
+
+
+def test_hgbr_save_load_forecast_equivalence(hgbr_trained, tmp_path) -> None:  # noqa: ANN001
+    forecaster, history, specs = hgbr_trained
+    at_time = history.index[-1] + pd.Timedelta(minutes=15)
+    future = _future(at_time)
+    expected = forecaster.predict(at_time, history, future, 132)
+    forecaster.save(tmp_path)
+
+    loaded = Forecaster.load(tmp_path, specs)
+    actual = loaded.predict(at_time, history, future, 132)
+
+    assert type(loaded.model) is RidgeHgbrDecomposedNetLoadModel
+    pd.testing.assert_frame_equal(actual, expected)
