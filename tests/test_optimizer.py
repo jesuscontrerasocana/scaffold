@@ -382,3 +382,24 @@ def test_infeasible_forecast_fails_clearly(specs: SiteSpecs) -> None:
         Optimizer(limited_specs).solve(
             forecast, prices, _context(forecast.index, weak_battery.max_soc)
         )
+
+
+def test_terminal_energy_is_at_least_half_capacity(specs: SiteSpecs) -> None:
+    optimizer = Optimizer(specs)
+
+    forecast, prices = _inputs(
+        net_kw=[0.0] * optimizer.MAX_HORIZON,
+        offtake=[200.0] * optimizer.MAX_HORIZON,
+        injection=[0.0] * optimizer.MAX_HORIZON,
+    )
+
+    context = _context(forecast.index, initial_soc=0.8)
+
+    optimizer.solve(forecast, prices, context)
+
+    terminal_energy = pyo.value(
+        optimizer.model.energy[optimizer.MAX_HORIZON-1]
+    )
+    maximum_energy = specs.battery.capacity_kwh * specs.battery.max_soc
+
+    assert terminal_energy >= 0.5 * maximum_energy - 1e-6

@@ -182,6 +182,8 @@ class Optimizer:
             )
 
         model.energy_balance = pyo.Constraint(model.steps, rule=energy_balance)
+
+        model.terminal_energy = pyo.Constraint(expr=model.energy[horizon_steps - 1] >= 0.5 * maximum_energy)
         model.grid_balance = pyo.Constraint(
             model.steps,
             rule=lambda m, step: m.grid_import[step] - m.grid_export[step]
