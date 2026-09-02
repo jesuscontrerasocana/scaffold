@@ -19,3 +19,4 @@
 - Reuse a fixed-size Pyomo optimizer model with mutable forecast, price, and initial-energy inputs.
 - Use a temporary MILP to prevent simultaneous battery charging and discharging only when published injection prices are negative.
 - Allow negative-price exclusivity to be disabled so all solves use the reusable LP.
+- Add deterministic incremental monthly peak-capacity cost to the battery optimizer.

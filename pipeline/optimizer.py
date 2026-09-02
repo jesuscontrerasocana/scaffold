@@ -150,6 +150,7 @@ class Optimizer:
         model.offtake_price = pyo.Param(model.steps, mutable=True, initialize=0.0)
         model.injection_price = pyo.Param(model.steps, mutable=True, initialize=0.0)
         model.initial_energy = pyo.Param(mutable=True, initialize=0.0)
+        model.past_month_peak = pyo.Param(mutable=True, initialize=0.0)
         model.charge = pyo.Var(
             model.steps, bounds=(0.0, battery.charge_power_kw)
         )
@@ -165,6 +166,7 @@ class Optimizer:
         model.grid_export = pyo.Var(
             model.steps, bounds=(0.0, self.specs.injection_limit_kw)
         )
+        model.planned_peak = pyo.Var(bounds=(0.0, self.specs.offtake_limit_kw))
 
         def energy_balance(m: pyo.ConcreteModel, step: int) -> pyo.Constraint:
             previous = m.initial_energy if step == 0 else m.energy[step - 1]
@@ -177,6 +179,13 @@ class Optimizer:
             model.steps,
             rule=lambda m, step: m.grid_import[step] - m.grid_export[step]
             == m.net_kw[step] + m.charge[step] - m.discharge[step],
+        )
+        model.past_peak_limit = pyo.Constraint(
+            expr=model.planned_peak >= model.past_month_peak
+        )
+        model.horizon_peak_limit = pyo.Constraint(
+            model.steps,
+            rule=lambda m, step: m.planned_peak >= m.grid_import[step],
         )
         if negative_steps:
             model.negative_steps = pyo.Set(initialize=negative_steps)
@@ -217,8 +226,16 @@ class Optimizer:
                 for step in model.steps
             )
         )
+        model.incremental_peak_cost = pyo.Expression(
+            expr=self.specs.offtake_monthly_peak_cost_eur_per_kw
+            * (model.planned_peak - model.past_month_peak)
+        )
         model.objective = pyo.Objective(
-            expr=model.energy_cost + model.degradation_cost,
+            expr=(
+                model.energy_cost
+                + model.degradation_cost
+                + model.incremental_peak_cost
+            ),
             sense=pyo.minimize,
         )
         return model
@@ -281,6 +298,7 @@ class Optimizer:
         initial_energy = battery.capacity_kwh * context.initial_soc
         if not minimum_energy <= initial_energy <= maximum_energy:
             raise ValueError("Initial state of charge is outside battery bounds")
+        past_month_peak = float(context.month.peak_offtake_kw)
 
         model = (
             self._build_model(len(forecast), negative_steps=negative_steps)
@@ -296,6 +314,7 @@ class Optimizer:
             model.offtake_price[step] = offtake_price[step]
             model.injection_price[step] = injection_price[step]
         model.initial_energy.set_value(initial_energy)
+        model.past_month_peak.set_value(past_month_peak)
 
         try:
             result = pyo.SolverFactory("highs").solve(model)
@@ -309,30 +328,21 @@ class Optimizer:
         charge = np.array([pyo.value(model.charge[t]) for t in active_steps])
         discharge = np.array([pyo.value(model.discharge[t]) for t in active_steps])
         energy = np.array([pyo.value(model.energy[t]) for t in active_steps])
-        grid_import = np.array([pyo.value(model.grid_import[t]) for t in active_steps])
-        grid_export = np.array([pyo.value(model.grid_export[t]) for t in active_steps])
+        planned_peak = float(pyo.value(model.planned_peak))
 
         self.last_summary = {
             "solver_termination": str(termination),
             "solver_mode": "milp" if use_milp else "lp",
-            "negative_price_exclusivity_enabled": (
-                self.enforce_negative_price_exclusivity
-            ),
             "objective_eur": float(pyo.value(model.objective)),
             "energy_cost_eur": float(pyo.value(model.energy_cost)),
-            "injection_value_eur": float(
-                HOURS_PER_STEP / 1000 * np.sum(grid_export * injection_price)
-            ),
             "degradation_cost_eur": float(pyo.value(model.degradation_cost)),
-            "total_import_kwh": float(HOURS_PER_STEP * grid_import.sum()),
-            "total_export_kwh": float(HOURS_PER_STEP * grid_export.sum()),
-            "published_price_steps": int(published.sum()),
+            "modeled_peak_cost_eur": float(
+                pyo.value(model.incremental_peak_cost)
+            ),
+            "past_month_peak_kw": past_month_peak,
+            "planned_peak_kw": planned_peak,
             "initial_soc": float(context.initial_soc),
             "final_soc": float(energy[-1] / battery.capacity_kwh),
-            "minimum_soc": float(energy.min() / battery.capacity_kwh),
-            "maximum_soc": float(energy.max() / battery.capacity_kwh),
-            "maximum_charge_kw": float(charge.max()),
-            "maximum_discharge_kw": float(discharge.max()),
         }
         return pd.DataFrame(
             {

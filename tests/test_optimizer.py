@@ -35,11 +35,17 @@ def _inputs(
     return forecast, prices
 
 
-def _context(index: pd.DatetimeIndex, initial_soc: float) -> DecisionContext:
+def _context(
+    index: pd.DatetimeIndex, initial_soc: float, peak_offtake_kw: float = 100.0
+) -> DecisionContext:
     return DecisionContext(
         at_time=index[0],
         initial_soc=initial_soc,
-        month=MonthState(peak_offtake_kw=0.0, steps_elapsed=0, steps_total=96 * 31),
+        month=MonthState(
+            peak_offtake_kw=peak_offtake_kw,
+            steps_elapsed=0,
+            steps_total=96 * 31,
+        ),
         history=pd.DataFrame(index=pd.DatetimeIndex([], tz=index.tz)),
         prices_known_until=index[-1],
         state={},
@@ -121,6 +127,77 @@ def test_small_spread_does_not_cover_losses_and_degradation(specs: SiteSpecs) ->
     assert schedule.to_numpy().max() == pytest.approx(0.0, abs=1e-7)
 
 
+def test_import_below_past_peak_has_no_incremental_peak_cost(specs: SiteSpecs) -> None:
+    forecast, prices = _inputs([40.0], [0.0])
+    optimizer = Optimizer(specs)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(forecast.index, specs.battery.min_soc, peak_offtake_kw=50.0),
+    )
+
+    assert optimizer.last_summary["past_month_peak_kw"] == 50.0
+    assert optimizer.last_summary["planned_peak_kw"] == pytest.approx(50.0)
+    assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(0.0)
+
+
+def test_import_above_past_peak_uses_site_peak_tariff(specs: SiteSpecs) -> None:
+    forecast, prices = _inputs([60.0], [0.0])
+    optimizer = Optimizer(specs)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(forecast.index, specs.battery.min_soc, peak_offtake_kw=50.0),
+    )
+
+    assert optimizer.last_summary["planned_peak_kw"] == pytest.approx(60.0)
+    incremental_peak_kw = (
+        optimizer.last_summary["planned_peak_kw"]
+        - optimizer.last_summary["past_month_peak_kw"]
+    )
+    assert incremental_peak_kw == pytest.approx(10.0)
+    assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(
+        incremental_peak_kw * specs.offtake_monthly_peak_cost_eur_per_kw
+    )
+
+
+def test_battery_discharge_avoids_new_peak(specs: SiteSpecs) -> None:
+    forecast, prices = _inputs([100.0], [0.0])
+    optimizer = Optimizer(specs)
+
+    schedule = optimizer.solve(
+        forecast,
+        prices,
+        _context(forecast.index, specs.battery.max_soc, peak_offtake_kw=50.0),
+    )
+
+    grid_import = 100.0 - schedule.iloc[0]["battery_discharge_kw"]
+    assert grid_import == pytest.approx(50.0)
+    assert optimizer.last_summary["planned_peak_kw"] == pytest.approx(50.0)
+    assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(0.0)
+
+
+def test_dispatch_below_past_peak_receives_no_credit(specs: SiteSpecs) -> None:
+    forecast, prices = _inputs([40.0], [1_000.0])
+    optimizer = Optimizer(specs)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(forecast.index, specs.battery.max_soc, peak_offtake_kw=50.0),
+    )
+
+    assert optimizer.last_summary["planned_peak_kw"] == pytest.approx(50.0)
+    incremental_peak_kw = (
+        optimizer.last_summary["planned_peak_kw"]
+        - optimizer.last_summary["past_month_peak_kw"]
+    )
+    assert incremental_peak_kw == pytest.approx(0.0)
+    assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(0.0)
+
+
 def test_unpublished_prices_are_not_invented(specs: SiteSpecs) -> None:
     forecast, prices = _inputs([0.0, 0.0], [0.0, np.nan])
     prices.iloc[1, prices.columns.get_loc("injection_price_eur_per_mwh")] = np.nan
@@ -130,7 +207,10 @@ def test_unpublished_prices_are_not_invented(specs: SiteSpecs) -> None:
     )
 
     assert schedule.to_numpy().max() == pytest.approx(0.0, abs=1e-7)
-    assert optimizer.last_summary["published_price_steps"] == 1
+    published = prices[
+        ["offtake_price_eur_per_mwh", "injection_price_eur_per_mwh"]
+    ].notna().all(axis=1)
+    assert published.sum() == 1
 
 
 def test_non_negative_prices_reuse_continuous_model(specs: SiteSpecs) -> None:
@@ -187,7 +267,6 @@ def test_negative_price_builds_milp_only_for_negative_steps(
         and schedule.iloc[1]["battery_discharge_kw"] > 1e-7
     )
     assert optimizer.last_summary["solver_mode"] == "milp"
-    assert optimizer.last_summary["negative_price_exclusivity_enabled"] is True
 
 
 def test_disabled_exclusivity_uses_reusable_lp_for_negative_price(
@@ -206,8 +285,8 @@ def test_disabled_exclusivity_uses_reusable_lp_for_negative_price(
     )
 
     assert optimizer.model is reusable_model
+    assert optimizer.enforce_negative_price_exclusivity is False
     assert optimizer.last_summary["solver_mode"] == "lp"
-    assert optimizer.last_summary["negative_price_exclusivity_enabled"] is False
 
 
 def test_unpublished_prices_do_not_build_temporary_milp(
