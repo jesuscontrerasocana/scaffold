@@ -756,9 +756,13 @@ class DecomposedRidgeNetLoadModel:
         features[cls.EXOG_FEATURE] = pd.to_numeric(
             exog.reindex(targets), errors="coerce"
         ).to_numpy(dtype=float)
+        if "lead_steps" in cls.PV_FEATURE_NAMES:
+            features["lead_steps"] = lead_steps
         return features.loc[:, cls.PV_FEATURE_NAMES]
 
-    def fit(self, history: pd.DataFrame) -> None:
+    def _fit_load_and_prepare_pv(
+        self, history: pd.DataFrame
+    ) -> tuple[pd.Series, pd.Series, pd.DatetimeIndex, pd.DataFrame]:
         net = pd.to_numeric(history["grid_net_kw"], errors="coerce")
         pv = pd.to_numeric(history["pv_production_kw"], errors="coerce")
         load = net + pv
@@ -786,7 +790,9 @@ class DecomposedRidgeNetLoadModel:
         )
         pv_fill[self.EXOG_FEATURE] = exog
         self.pv_fill_values = {
-            name: float(pv_fill[name].median()) for name in self.PV_FEATURE_NAMES
+            name: float(pv_fill[name].median())
+            for name in self.PV_FEATURE_NAMES
+            if name in pv_fill
         }
         if not all(
             np.isfinite(
@@ -798,10 +804,7 @@ class DecomposedRidgeNetLoadModel:
 
         self.load_scalers = []
         self.load_models = []
-        self.pv_scalers = []
-        self.pv_models = []
         self.load_summaries = []
-        self.pv_summaries = []
         for lead_steps in range(1, self.MAX_HORIZON + 1):
             targets = decisions + (lead_steps - 1) * STEP
             load_target = load.reindex(targets)
@@ -818,6 +821,16 @@ class DecomposedRidgeNetLoadModel:
             self.load_scalers.append(scaler)
             self.load_models.append(model)
             self.load_summaries.append(summary)
+
+        return pv, exog, decisions, pv_decision
+
+    def fit(self, history: pd.DataFrame) -> None:
+        pv, exog, decisions, pv_decision = self._fit_load_and_prepare_pv(history)
+        self.pv_scalers = []
+        self.pv_models = []
+        self.pv_summaries = []
+        for lead_steps in range(1, self.MAX_HORIZON + 1):
+            targets = decisions + (lead_steps - 1) * STEP
 
             pv_target = pv.reindex(targets)
             pv_target.index = decisions
@@ -897,6 +910,8 @@ class DecomposedRidgeNetLoadModel:
         pv_features[self.EXOG_FEATURE] = pd.to_numeric(
             future_exog[self.EXOG_FEATURE].reindex(index), errors="coerce"
         )
+        if "lead_steps" in self.PV_FEATURE_NAMES:
+            pv_features["lead_steps"] = np.arange(1, len(index) + 1)
         pv_features = pv_features.loc[:, self.PV_FEATURE_NAMES].fillna(
             self.pv_fill_values
         )
@@ -1011,6 +1026,11 @@ class RidgeHgbrDecomposedNetLoadModel(DecomposedRidgeNetLoadModel):
         "l2_regularization": 1.0,
         "random_state": 0,
     }
+    PV_FEATURE_NAMES = DecomposedRidgeNetLoadModel.PV_FEATURE_NAMES + ("lead_steps",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pv_model: HistGradientBoostingRegressor | None = None
 
     def _set_inference_parameters(self) -> None:
         self.load_inference_weights, self.load_inference_intercepts = (
@@ -1018,17 +1038,12 @@ class RidgeHgbrDecomposedNetLoadModel(DecomposedRidgeNetLoadModel):
         )
 
     def fit(self, history: pd.DataFrame) -> None:
-        # Reuse the established decomposed training path so the load models and their
-        # fill values remain exactly the same as ``ridge_decomposed``.
-        super().fit(history)
-
-        pv = pd.to_numeric(history["pv_production_kw"], errors="coerce")
-        exog = pd.to_numeric(history[self.EXOG_FEATURE], errors="coerce")
-        decisions = history.index
-        pv_decision = self._pv_decision_features(pv, decisions)
+        pv, exog, decisions, pv_decision = self._fit_load_and_prepare_pv(history)
         self.pv_scalers = []
         self.pv_models = []
         self.pv_summaries = []
+        training_features: list[pd.DataFrame] = []
+        training_targets: list[pd.Series] = []
 
         for lead_steps in range(1, self.MAX_HORIZON + 1):
             targets = decisions + (lead_steps - 1) * STEP
@@ -1045,23 +1060,22 @@ class RidgeHgbrDecomposedNetLoadModel(DecomposedRidgeNetLoadModel):
             )
             if usable.sum() < 12:
                 raise ValueError(f"HGBR PV lead {lead_steps} requires 12 usable rows")
+            training_features.append(features.loc[usable])
+            training_targets.append(target.loc[usable])
 
-            model = HistGradientBoostingRegressor(**self.HGBR_PARAMETERS)
-            model.fit(features.loc[usable], target.loc[usable])
-            fitted = model.predict(features.loc[usable])
-            self.pv_models.append(model)
-            self.pv_summaries.append(
-                {
-                    "lead_steps": lead_steps,
-                    "lead_minutes": (lead_steps - 1) * 15,
-                    "training_samples": int(usable.sum()),
-                    "dropped_rows": int((~usable).sum()),
-                    "train_mae": float(mean_absolute_error(target.loc[usable], fitted)),
-                    "train_rmse": float(
-                        mean_squared_error(target.loc[usable], fitted) ** 0.5
-                    ),
-                }
-            )
+        all_features = pd.concat(training_features, ignore_index=True)
+        all_targets = pd.concat(training_targets, ignore_index=True)
+        self.pv_model = HistGradientBoostingRegressor(**self.HGBR_PARAMETERS)
+        self.pv_model.fit(all_features, all_targets)
+        fitted = self.pv_model.predict(all_features)
+        self.pv_summaries = [
+            {
+                "training_samples": len(all_targets),
+                "train_mae": float(mean_absolute_error(all_targets, fitted)),
+                "train_rmse": float(mean_squared_error(all_targets, fitted) ** 0.5),
+            }
+        ]
+        self._set_inference_parameters()
 
     def _predict_components(
         self,
@@ -1078,15 +1092,9 @@ class RidgeHgbrDecomposedNetLoadModel(DecomposedRidgeNetLoadModel):
             self.load_inference_weights,
             self.load_inference_intercepts,
         )
-        pv_prediction = np.maximum(
-            np.array(
-                [
-                    model.predict(pv_features.iloc[[lead]])[0]
-                    for lead, model in enumerate(self.pv_models[: len(index)])
-                ]
-            ),
-            0.0,
-        )
+        if self.pv_model is None:
+            raise ValueError("HGBR PV model has not been fitted")
+        pv_prediction = np.maximum(self.pv_model.predict(pv_features), 0.0)
         return (
             pd.Series(load_prediction, index=index),
             pd.Series(pv_prediction, index=index),
@@ -1097,6 +1105,23 @@ class RidgeHgbrDecomposedNetLoadModel(DecomposedRidgeNetLoadModel):
         state["pv"]["model"] = "HistGradientBoostingRegressor"
         state["pv"]["parameters"] = self.HGBR_PARAMETERS
         return state
+
+    def save_artifact(self, path: Path) -> None:
+        joblib.dump(
+            {
+                "load_scalers": self.load_scalers,
+                "load_models": self.load_models,
+                "pv_model": self.pv_model,
+            },
+            Path(path) / self.ARTIFACT,
+        )
+
+    def load_artifact(self, path: Path) -> None:
+        artifact = joblib.load(Path(path) / self.ARTIFACT)
+        self.load_scalers = artifact["load_scalers"]
+        self.load_models = artifact["load_models"]
+        self.pv_model = artifact["pv_model"]
+        self._set_inference_parameters()
 
 
 class Forecaster:

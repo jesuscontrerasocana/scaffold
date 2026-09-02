@@ -350,6 +350,8 @@ def test_hgbr_full_horizon_output_and_load_models(
     assert len(prediction) == 132
     assert np.isfinite(prediction).all().all()
     assert (prediction["pv_kw"] >= 0).all()
+    assert hgbr.model.pv_model is not None
+    assert hgbr.model.pv_models == []
     for ridge_model, hgbr_load_model in zip(
         ridge.model.load_models, hgbr.model.load_models, strict=True
     ):
@@ -380,8 +382,11 @@ def test_hgbr_clips_negative_pv_predictions(
     at_time = history.index[-1] + pd.Timedelta(minutes=15)
     future = _future(at_time)
 
-    for model in forecaster.model.pv_models:
-        monkeypatch.setattr(model, "predict", lambda features: -np.ones(len(features)))
+    monkeypatch.setattr(
+        forecaster.model.pv_model,
+        "predict",
+        lambda features: -np.ones(len(features)),
+    )
 
     prediction = forecaster.predict(at_time, history, future, 132)
 
@@ -389,6 +394,28 @@ def test_hgbr_clips_negative_pv_predictions(
     pd.testing.assert_series_equal(
         prediction["net_kw"], prediction["load_kw"], check_names=False
     )
+
+
+def test_hgbr_predicts_full_horizon_once_with_lead_feature(
+    hgbr_trained, monkeypatch: pytest.MonkeyPatch
+) -> None:  # noqa: ANN001
+    forecaster, history, _ = hgbr_trained
+    at_time = history.index[-1] + pd.Timedelta(minutes=15)
+    future = _future(at_time)
+    calls: list[pd.DataFrame] = []
+    original_predict = forecaster.model.pv_model.predict
+
+    def record_predict(features: pd.DataFrame) -> np.ndarray:
+        calls.append(features.copy())
+        return original_predict(features)
+
+    monkeypatch.setattr(forecaster.model.pv_model, "predict", record_predict)
+
+    forecaster.predict(at_time, history, future, 132)
+
+    assert len(calls) == 1
+    assert len(calls[0]) == 132
+    assert calls[0]["lead_steps"].tolist() == list(range(1, 133))
 
 
 def test_hgbr_save_load_forecast_equivalence(hgbr_trained, tmp_path) -> None:  # noqa: ANN001
