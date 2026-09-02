@@ -6,7 +6,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pipeline.forecaster import DecomposedRidgeNetLoadModel, Forecaster
+from pipeline.forecaster import (
+    DecomposedRidgeNetLoadModel,
+    DirectRidgeNetLoadModel,
+    Forecaster,
+    _predict_ridge_leads,
+    build_lag_features,
+)
 from pipeline.specs import SiteSpecs
 
 
@@ -39,6 +45,60 @@ def _future(at_time: pd.Timestamp, horizon: int = 132) -> pd.DataFrame:
         )},
         index=index,
     )
+
+
+def _legacy_predict_components(
+    model: DecomposedRidgeNetLoadModel,
+    history: pd.DataFrame,
+    future_exog: pd.DataFrame,
+    index: pd.DatetimeIndex,
+    at_time: pd.Timestamp,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reconstruct the pre-optimization inference path for parity testing."""
+    known = history.loc[history.index < at_time]
+    pv = pd.to_numeric(known["pv_production_kw"], errors="coerce")
+    load = pd.to_numeric(known["grid_net_kw"], errors="coerce") + pv
+    load_recent = model._load_decision_features(
+        load, pd.DatetimeIndex([at_time])
+    ).iloc[0]
+    load_features = DirectRidgeNetLoadModel._target_calendar(index)
+    for name, value in load_recent.items():
+        load_features[name] = value
+    seasonal = build_lag_features(
+        load, index, (pd.Timedelta(days=1), pd.Timedelta(days=7))
+    )
+    load_features["load_target_minus_1day"] = seasonal["lag_1day"]
+    load_features.loc[
+        index - pd.Timedelta(days=1) >= at_time,
+        "load_target_minus_1day",
+    ] = np.nan
+    load_features["load_target_minus_7day"] = seasonal["lag_7day"]
+    load_features = load_features.loc[:, model.LOAD_FEATURE_NAMES].fillna(
+        model.load_fill_values
+    )
+
+    pv_recent = model._pv_decision_features(
+        pv, pd.DatetimeIndex([at_time])
+    ).iloc[0]
+    pv_features = DirectRidgeNetLoadModel._target_calendar(index).loc[
+        :, ["time_of_day_sin", "time_of_day_cos"]
+    ]
+    for name, value in pv_recent.items():
+        pv_features[name] = value
+    pv_features[model.EXOG_FEATURE] = pd.to_numeric(
+        future_exog[model.EXOG_FEATURE].reindex(index), errors="coerce"
+    )
+    pv_features = pv_features.loc[:, model.PV_FEATURE_NAMES].fillna(
+        model.pv_fill_values
+    )
+
+    load_prediction = _predict_ridge_leads(
+        load_features, model.load_scalers, model.load_models
+    )
+    pv_prediction = np.maximum(
+        _predict_ridge_leads(pv_features, model.pv_scalers, model.pv_models), 0.0
+    )
+    return load_prediction, pv_prediction
 
 
 @pytest.fixture(scope="module")
@@ -184,34 +244,43 @@ def test_save_load_and_metadata(trained, tmp_path) -> None:  # noqa: ANN001
     assert len(state["pv"]["lead_models"]) == 132
 
 
-def test_recent_features_are_built_once_per_prediction(
+@pytest.mark.parametrize("decision_position", [20, 105, 10 * 96 + 48, 12 * 96])
+def test_optimized_inference_matches_previous_features(
+    trained, decision_position: int
+) -> None:  # noqa: ANN001
+    forecaster, history, _ = trained
+    at_time = history.index[0] + decision_position * pd.Timedelta(minutes=15)
+    future = _future(at_time)
+    expected_load, expected_pv = _legacy_predict_components(
+        forecaster.model, history, future, future.index, at_time
+    )
+
+    actual_load, actual_pv = forecaster.model._predict_components(
+        history, future, future.index, at_time
+    )
+
+    np.testing.assert_allclose(actual_load, expected_load, atol=1e-8, rtol=0)
+    np.testing.assert_allclose(actual_pv, expected_pv, atol=1e-8, rtol=0)
+
+
+def test_prediction_skips_generic_history_feature_builders(
     trained, monkeypatch: pytest.MonkeyPatch
 ) -> None:  # noqa: ANN001
     forecaster, history, _ = trained
     at_time = history.index[-1] + pd.Timedelta(minutes=15)
-    calls = {"load": 0, "pv": 0}
-    load_original = DecomposedRidgeNetLoadModel._load_decision_features
-    pv_original = DecomposedRidgeNetLoadModel._pv_decision_features
 
-    def load_recording(load, decisions):  # noqa: ANN001
-        calls["load"] += 1
-        return load_original(load, decisions)
-
-    def pv_recording(pv, decisions):  # noqa: ANN001
-        calls["pv"] += 1
-        return pv_original(pv, decisions)
+    def fail_if_called(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("Generic history feature builder used during prediction")
 
     monkeypatch.setattr(
         DecomposedRidgeNetLoadModel,
         "_load_decision_features",
-        staticmethod(load_recording),
+        staticmethod(fail_if_called),
     )
     monkeypatch.setattr(
         DecomposedRidgeNetLoadModel,
         "_pv_decision_features",
-        staticmethod(pv_recording),
+        staticmethod(fail_if_called),
     )
 
     forecaster.predict(at_time, history, _future(at_time), 132)
-
-    assert calls == {"load": 1, "pv": 1}
