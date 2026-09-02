@@ -387,6 +387,27 @@ def _predict_ridge_leads(
     return np.sum(((values - means) / scales) * coefficients, axis=1) + intercepts
 
 
+def _ridge_inference_parameters(
+    scalers: list[StandardScaler], models: list[Ridge]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Collapse fitted scaler/Ridge pairs into original-feature linear parameters."""
+    means = np.vstack([scaler.mean_ for scaler in scalers])
+    scales = np.vstack([scaler.scale_ for scaler in scalers])
+    weights = np.vstack([model.coef_ for model in models]) / scales
+    intercepts = np.asarray([model.intercept_ for model in models]) - np.sum(
+        means * weights, axis=1
+    )
+    return weights, intercepts
+
+
+def _predict_precomputed_ridge_leads(
+    features: pd.DataFrame, weights: np.ndarray, intercepts: np.ndarray
+) -> np.ndarray:
+    count = len(features)
+    values = features.to_numpy(dtype=float)
+    return np.sum(values * weights[:count], axis=1) + intercepts[:count]
+
+
 class DirectRidgeNetLoadModel:
     """One direct Ridge model per forecast lead time."""
 
@@ -420,6 +441,13 @@ class DirectRidgeNetLoadModel:
         self.models: list[Ridge] = []
         self.fill_values: dict[str, float] = {}
         self.lead_summaries: list[dict[str, object]] = []
+        self.inference_weights = np.empty((0, len(self.FEATURE_NAMES)))
+        self.inference_intercepts = np.empty(0)
+
+    def _set_inference_parameters(self) -> None:
+        self.inference_weights, self.inference_intercepts = (
+            _ridge_inference_parameters(self.scalers, self.models)
+        )
 
     @staticmethod
     def _target_calendar(index: pd.DatetimeIndex) -> pd.DataFrame:
@@ -513,6 +541,7 @@ class DirectRidgeNetLoadModel:
             self.scalers.append(scaler)
             self.models.append(model)
             self.lead_summaries.append(summary)
+        self._set_inference_parameters()
 
     def predict(
         self,
@@ -550,7 +579,9 @@ class DirectRidgeNetLoadModel:
         )
         features = features.loc[:, self.FEATURE_NAMES].fillna(self.fill_values)
 
-        predictions = _predict_ridge_leads(features, self.scalers, self.models)
+        predictions = _predict_precomputed_ridge_leads(
+            features, self.inference_weights, self.inference_intercepts
+        )
         return pd.Series(predictions, index=index)
 
     def state(self) -> dict[str, object]:
@@ -594,6 +625,7 @@ class DirectRidgeNetLoadModel:
         artifact = joblib.load(Path(path) / self.ARTIFACT)
         self.scalers = artifact["scalers"]
         self.models = artifact["models"]
+        self._set_inference_parameters()
 
 
 class DecomposedRidgeNetLoadModel:
@@ -637,6 +669,18 @@ class DecomposedRidgeNetLoadModel:
         self.pv_fill_values: dict[str, float] = {}
         self.load_summaries: list[dict[str, object]] = []
         self.pv_summaries: list[dict[str, object]] = []
+        self.load_inference_weights = np.empty((0, len(self.LOAD_FEATURE_NAMES)))
+        self.load_inference_intercepts = np.empty(0)
+        self.pv_inference_weights = np.empty((0, len(self.PV_FEATURE_NAMES)))
+        self.pv_inference_intercepts = np.empty(0)
+
+    def _set_inference_parameters(self) -> None:
+        self.load_inference_weights, self.load_inference_intercepts = (
+            _ridge_inference_parameters(self.load_scalers, self.load_models)
+        )
+        self.pv_inference_weights, self.pv_inference_intercepts = (
+            _ridge_inference_parameters(self.pv_scalers, self.pv_models)
+        )
 
     @staticmethod
     def _load_decision_features(
@@ -786,6 +830,7 @@ class DecomposedRidgeNetLoadModel:
             self.pv_scalers.append(scaler)
             self.pv_models.append(model)
             self.pv_summaries.append(summary)
+        self._set_inference_parameters()
 
     def _prediction_features(
         self,
@@ -869,11 +914,18 @@ class DecomposedRidgeNetLoadModel:
             history, future_exog, index, at_time
         )
 
-        load_prediction = _predict_ridge_leads(
-            load_features, self.load_scalers, self.load_models
+        load_prediction = _predict_precomputed_ridge_leads(
+            load_features,
+            self.load_inference_weights,
+            self.load_inference_intercepts,
         )
         pv_prediction = np.maximum(
-            _predict_ridge_leads(pv_features, self.pv_scalers, self.pv_models), 0.0
+            _predict_precomputed_ridge_leads(
+                pv_features,
+                self.pv_inference_weights,
+                self.pv_inference_intercepts,
+            ),
+            0.0,
         )
         return (
             pd.Series(load_prediction, index=index),
@@ -946,6 +998,7 @@ class DecomposedRidgeNetLoadModel:
         self.load_models = artifact["load_models"]
         self.pv_scalers = artifact["pv_scalers"]
         self.pv_models = artifact["pv_models"]
+        self._set_inference_parameters()
 
 
 class RidgeHgbrDecomposedNetLoadModel(DecomposedRidgeNetLoadModel):
@@ -958,6 +1011,11 @@ class RidgeHgbrDecomposedNetLoadModel(DecomposedRidgeNetLoadModel):
         "l2_regularization": 1.0,
         "random_state": 0,
     }
+
+    def _set_inference_parameters(self) -> None:
+        self.load_inference_weights, self.load_inference_intercepts = (
+            _ridge_inference_parameters(self.load_scalers, self.load_models)
+        )
 
     def fit(self, history: pd.DataFrame) -> None:
         # Reuse the established decomposed training path so the load models and their
@@ -1015,8 +1073,10 @@ class RidgeHgbrDecomposedNetLoadModel(DecomposedRidgeNetLoadModel):
         load_features, pv_features = self._prediction_features(
             history, future_exog, index, at_time
         )
-        load_prediction = _predict_ridge_leads(
-            load_features, self.load_scalers, self.load_models
+        load_prediction = _predict_precomputed_ridge_leads(
+            load_features,
+            self.load_inference_weights,
+            self.load_inference_intercepts,
         )
         pv_prediction = np.maximum(
             np.array(
