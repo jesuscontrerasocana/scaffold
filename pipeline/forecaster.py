@@ -49,6 +49,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import StandardScaler
@@ -786,13 +787,13 @@ class DecomposedRidgeNetLoadModel:
             self.pv_models.append(model)
             self.pv_summaries.append(summary)
 
-    def _predict_components(
+    def _prediction_features(
         self,
         history: pd.DataFrame,
         future_exog: pd.DataFrame,
         index: pd.DatetimeIndex,
         at_time: pd.Timestamp,
-    ) -> tuple[pd.Series, pd.Series]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
         if len(index) > self.MAX_HORIZON:
             raise ValueError(f"Ridge horizon cannot exceed {self.MAX_HORIZON} steps")
         recent_index = pd.date_range(end=at_time - STEP, periods=16, freq=STEP)
@@ -853,6 +854,19 @@ class DecomposedRidgeNetLoadModel:
         )
         pv_features = pv_features.loc[:, self.PV_FEATURE_NAMES].fillna(
             self.pv_fill_values
+        )
+
+        return load_features, pv_features
+
+    def _predict_components(
+        self,
+        history: pd.DataFrame,
+        future_exog: pd.DataFrame,
+        index: pd.DatetimeIndex,
+        at_time: pd.Timestamp,
+    ) -> tuple[pd.Series, pd.Series]:
+        load_features, pv_features = self._prediction_features(
+            history, future_exog, index, at_time
         )
 
         load_prediction = _predict_ridge_leads(
@@ -934,6 +948,97 @@ class DecomposedRidgeNetLoadModel:
         self.pv_models = artifact["pv_models"]
 
 
+class RidgeHgbrDecomposedNetLoadModel(DecomposedRidgeNetLoadModel):
+    """Existing Ridge load forecast combined with direct HGBR PV forecasts."""
+
+    HGBR_PARAMETERS = {
+        "learning_rate": 0.08,
+        "max_iter": 50,
+        "max_leaf_nodes": 15,
+        "l2_regularization": 1.0,
+        "random_state": 0,
+    }
+
+    def fit(self, history: pd.DataFrame) -> None:
+        # Reuse the established decomposed training path so the load models and their
+        # fill values remain exactly the same as ``ridge_decomposed``.
+        super().fit(history)
+
+        pv = pd.to_numeric(history["pv_production_kw"], errors="coerce")
+        exog = pd.to_numeric(history[self.EXOG_FEATURE], errors="coerce")
+        decisions = history.index
+        pv_decision = self._pv_decision_features(pv, decisions)
+        self.pv_scalers = []
+        self.pv_models = []
+        self.pv_summaries = []
+
+        for lead_steps in range(1, self.MAX_HORIZON + 1):
+            targets = decisions + (lead_steps - 1) * STEP
+            target = pv.reindex(targets)
+            target.index = decisions
+            features = self._pv_features_for_lead(
+                pv_decision, exog, lead_steps
+            ).fillna(self.pv_fill_values)
+            usable = (
+                features.notna().all(axis=1)
+                & np.isfinite(features).all(axis=1)
+                & target.notna()
+                & np.isfinite(target)
+            )
+            if usable.sum() < 12:
+                raise ValueError(f"HGBR PV lead {lead_steps} requires 12 usable rows")
+
+            model = HistGradientBoostingRegressor(**self.HGBR_PARAMETERS)
+            model.fit(features.loc[usable], target.loc[usable])
+            fitted = model.predict(features.loc[usable])
+            self.pv_models.append(model)
+            self.pv_summaries.append(
+                {
+                    "lead_steps": lead_steps,
+                    "lead_minutes": (lead_steps - 1) * 15,
+                    "training_samples": int(usable.sum()),
+                    "dropped_rows": int((~usable).sum()),
+                    "train_mae": float(mean_absolute_error(target.loc[usable], fitted)),
+                    "train_rmse": float(
+                        mean_squared_error(target.loc[usable], fitted) ** 0.5
+                    ),
+                }
+            )
+
+    def _predict_components(
+        self,
+        history: pd.DataFrame,
+        future_exog: pd.DataFrame,
+        index: pd.DatetimeIndex,
+        at_time: pd.Timestamp,
+    ) -> tuple[pd.Series, pd.Series]:
+        load_features, pv_features = self._prediction_features(
+            history, future_exog, index, at_time
+        )
+        load_prediction = _predict_ridge_leads(
+            load_features, self.load_scalers, self.load_models
+        )
+        pv_prediction = np.maximum(
+            np.array(
+                [
+                    model.predict(pv_features.iloc[[lead]])[0]
+                    for lead, model in enumerate(self.pv_models[: len(index)])
+                ]
+            ),
+            0.0,
+        )
+        return (
+            pd.Series(load_prediction, index=index),
+            pd.Series(pv_prediction, index=index),
+        )
+
+    def state(self) -> dict[str, object]:
+        state = super().state()
+        state["pv"]["model"] = "HistGradientBoostingRegressor"
+        state["pv"]["parameters"] = self.HGBR_PARAMETERS
+        return state
+
+
 class Forecaster:
     """Harness-facing wrapper for the selected forecasting baseline."""
 
@@ -943,6 +1048,7 @@ class Forecaster:
     WEEKLY = "weekly"
     RIDGE = "ridge"
     RIDGE_DECOMPOSED = "ridge_decomposed"
+    RIDGE_HGBR_DECOMPOSED = "ridge_hgbr_decomposed"
 
     def __init__(self, specs: SiteSpecs, model_name: str = SELECTED_MODEL) -> None:
         self.specs = specs
@@ -966,6 +1072,8 @@ class Forecaster:
             return DirectRidgeNetLoadModel()
         if model_name == Forecaster.RIDGE_DECOMPOSED:
             return DecomposedRidgeNetLoadModel()
+        if model_name == Forecaster.RIDGE_HGBR_DECOMPOSED:
+            return RidgeHgbrDecomposedNetLoadModel()
         raise ValueError(f"Unknown forecasting model: {model_name}")
 
     def fit(self, history: pd.DataFrame) -> None:
