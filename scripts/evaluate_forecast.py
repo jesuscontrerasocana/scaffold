@@ -22,6 +22,11 @@ from pipeline.specs import SiteSpecs
 
 EXOG_COLUMNS = ["most_recent_load_factor_forecast"]
 PRICE_COLUMNS = ["offtake_price_eur_per_mwh", "injection_price_eur_per_mwh"]
+COMPONENT_COLUMNS = {
+    "net": ("actual_kw", "predicted_kw"),
+    "load": ("actual_load_kw", "forecast_load_kw"),
+    "pv": ("actual_pv_kw", "forecast_pv_kw"),
+}
 
 
 def calculate_metrics(actual: pd.Series, predicted: pd.Series) -> dict[str, float]:
@@ -46,6 +51,23 @@ def calculate_metrics(actual: pd.Series, predicted: pd.Series) -> dict[str, floa
     }
 
 
+def component_metrics(comparisons: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Calculate metrics for each forecast component with available actuals."""
+
+    results = {}
+    for component, (actual_column, forecast_column) in COMPONENT_COLUMNS.items():
+        if not {actual_column, forecast_column}.issubset(comparisons.columns):
+            continue
+        pairs = comparisons[[actual_column, forecast_column]].replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
+        if not pairs.empty:
+            results[component] = calculate_metrics(
+                pairs[actual_column], pairs[forecast_column]
+            )
+    return results
+
+
 def collect_forecasts(
     data: pd.DataFrame,
     forecaster: Forecaster,
@@ -55,6 +77,9 @@ def collect_forecasts(
 
     rows: list[pd.DataFrame] = []
     for at_time in decision_times(data.index, config):
+        if at_time.minute == 0 and at_time.hour == 0:
+            print(at_time)
+
         history = data.loc[data.index < at_time]
         horizon_index = pd.date_range(
             at_time, periods=config.horizon_steps, freq=STEP, tz=data.index.tz
@@ -80,17 +105,34 @@ def collect_forecasts(
         if forecast[FORECAST_COL].isna().any():
             raise ValueError("Forecaster returned NaN or an incomplete horizon")
 
-        rows.append(
-            pd.DataFrame(
-                {
-                    "decision_time": at_time,
-                    "target_time": horizon_index,
-                    "lead_steps": np.arange(1, len(horizon_index) + 1),
-                    "actual_kw": data.loc[horizon_index, "grid_net_kw"].to_numpy(),
-                    "predicted_kw": forecast[FORECAST_COL].to_numpy(),
-                }
-            )
+        comparison = pd.DataFrame(
+            {
+                "decision_time": at_time,
+                "target_time": horizon_index,
+                "lead_steps": np.arange(1, len(horizon_index) + 1),
+                "actual_kw": data.loc[horizon_index, "grid_net_kw"].to_numpy(),
+                "predicted_kw": forecast[FORECAST_COL].to_numpy(),
+            }
         )
+        if "load_kw" in forecast:
+            comparison["forecast_load_kw"] = forecast["load_kw"].to_numpy()
+            if "pv_production_kw" in data:
+                actual_pv = data.loc[horizon_index, "pv_production_kw"]
+                comparison["actual_load_kw"] = (
+                    data.loc[horizon_index, "grid_net_kw"] + actual_pv
+                ).to_numpy()
+                comparison["load_error_kw"] = (
+                    comparison["forecast_load_kw"] - comparison["actual_load_kw"]
+                )
+        if "pv_kw" in forecast:
+            comparison["forecast_pv_kw"] = forecast["pv_kw"].to_numpy()
+            if "pv_production_kw" in data:
+                actual_pv = data.loc[horizon_index, "pv_production_kw"]
+                comparison["actual_pv_kw"] = actual_pv.to_numpy()
+                comparison["pv_error_kw"] = (
+                    comparison["forecast_pv_kw"] - comparison["actual_pv_kw"]
+                )
+        rows.append(comparison)
 
     if not rows:
         raise ValueError("No forecasts were produced for the requested window")
@@ -99,18 +141,46 @@ def collect_forecasts(
 
 def lead_metrics(comparisons: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for lead_step, group in comparisons.groupby("lead_steps", sort=True):
-        metrics = calculate_metrics(group["actual_kw"], group["predicted_kw"])
-        rows.append(
-            {
-                "lead_steps": int(lead_step),
-                **{
-                    key: metrics[key]
-                    for key in ("mae_kw", "rmse_kw", "bias_kw")
-                },
-            }
-        )
+    for component, (actual_column, forecast_column) in COMPONENT_COLUMNS.items():
+        if not {actual_column, forecast_column}.issubset(comparisons.columns):
+            continue
+        for lead_step, group in comparisons.groupby("lead_steps", sort=True):
+            pairs = group[[actual_column, forecast_column]].replace(
+                [np.inf, -np.inf], np.nan
+            ).dropna()
+            if pairs.empty:
+                continue
+            metrics = calculate_metrics(pairs[actual_column], pairs[forecast_column])
+            rows.append(
+                {
+                    "component": component,
+                    "lead_step": int(lead_step),
+                    **{
+                        key: metrics[key]
+                        for key in ("mae_kw", "rmse_kw", "bias_kw")
+                    },
+                }
+            )
     return pd.DataFrame(rows)
+
+
+def _print_metrics(metrics: dict[str, dict[str, float]]) -> None:
+    if list(metrics) == ["net"]:
+        values = metrics["net"]
+        print(f"MAE (kW): {values['mae_kw']:.4f}")
+        print(f"RMSE (kW): {values['rmse_kw']:.4f}")
+        print(f"Bias (kW): {values['bias_kw']:.4f}")
+        print(f"nMAE: {values['nmae']:.4f}")
+        return
+
+    labels = {"net": "Net load", "load": "Load", "pv": "PV"}
+    for component, values in metrics.items():
+        print(f"{labels[component]}:")
+        print(f"  MAE (kW): {values['mae_kw']:.4f}")
+        print(f"  RMSE (kW): {values['rmse_kw']:.4f}")
+        print(f"  Bias (kW): {values['bias_kw']:.4f}")
+        print(f"  nMAE: {values['nmae']:.4f}")
+        print()
 
 
 def _timestamp(value: str, timezone: str, end_of_day: bool = False) -> pd.Timestamp:
@@ -154,7 +224,7 @@ def main() -> None:
     )
 
     comparisons = collect_forecasts(data, forecaster, config)
-    metrics = calculate_metrics(comparisons["actual_kw"], comparisons["predicted_kw"])
+    metrics = component_metrics(comparisons)
     per_lead = lead_metrics(comparisons)
     out_path = args.out or args.model_dir / "forecast_lead_metrics.csv"
     comparisons_path = out_path.with_name("forecast_comparisons.csv")
@@ -162,10 +232,7 @@ def main() -> None:
     per_lead.to_csv(out_path, index=False)
     comparisons.to_csv(comparisons_path, index=False)
 
-    print(f"MAE (kW): {metrics['mae_kw']:.4f}")
-    print(f"RMSE (kW): {metrics['rmse_kw']:.4f}")
-    print(f"Bias (kW): {metrics['bias_kw']:.4f}")
-    print(f"nMAE: {metrics['nmae']:.4f}")
+    _print_metrics(metrics)
     print(f"Lead-step metrics: {out_path}")
     print(f"Forecast comparisons: {comparisons_path}")
 
