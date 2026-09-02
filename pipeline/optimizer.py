@@ -75,6 +75,62 @@ from pyomo.contrib.appsi.solvers import Highs
 from pipeline.data import HOURS_PER_STEP
 from pipeline.harness import DecisionContext
 from pipeline.specs import SiteSpecs
+
+
+PRICE_COLUMNS = (
+    "offtake_price_eur_per_mwh",
+    "injection_price_eur_per_mwh",
+)
+
+
+def _fill_unpublished_prices(
+    prices: pd.DataFrame,
+    history: pd.DataFrame,
+    at_time: pd.Timestamp,
+) -> tuple[pd.DataFrame, int, str]:
+    """Fill missing prices from the nearest earlier same-type local calendar day."""
+    filled = prices.loc[:, PRICE_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    safe_history = history.loc[history.index < at_time]
+    available_columns = [column for column in PRICE_COLUMNS if column in safe_history]
+    if not available_columns:
+        return filled, 0, "unavailable"
+
+    historical = safe_history.loc[:, available_columns].apply(
+        pd.to_numeric, errors="coerce"
+    ).sort_index()
+    references: set[str] = set()
+    filled_steps: set[pd.Timestamp] = set()
+
+    for target_day in filled.index.normalize().unique():
+        eligible = (
+            (historical.index.normalize() < target_day)
+            & ((historical.index.weekday >= 5) == (target_day.weekday() >= 5))
+        )
+        target_timestamps = filled.index[filled.index.normalize() == target_day]
+        for column in available_columns:
+            candidates = historical.loc[eligible, column].dropna()
+            latest_by_slot = candidates.groupby(
+                [candidates.index.hour, candidates.index.minute]
+            ).tail(1)
+            lookup = {
+                (timestamp.hour, timestamp.minute): (value, timestamp.date())
+                for timestamp, value in latest_by_slot.items()
+            }
+            for timestamp in target_timestamps:
+                if pd.notna(filled.at[timestamp, column]):
+                    continue
+                fallback = lookup.get((timestamp.hour, timestamp.minute))
+                if fallback is None:
+                    continue
+                value, reference_day = fallback
+                filled.at[timestamp, column] = value
+                filled_steps.add(timestamp)
+                references.add(str(reference_day))
+
+    reference_days = ", ".join(sorted(references)) if references else "unavailable"
+    return filled, len(filled_steps), reference_days
+
+
 class ScaffoldOptimizer:
     """BASELINE — replace me. Charge when power is cheap, discharge when it is dear."""
 
@@ -284,21 +340,21 @@ class Optimizer:
         if not np.isfinite(net).all():
             raise ValueError("Forecast net_kw must contain only finite values")
 
-        offtake_price = pd.to_numeric(
-            prices["offtake_price_eur_per_mwh"], errors="coerce"
-        ).to_numpy(dtype=float)
-        injection_price = pd.to_numeric(
-            prices["injection_price_eur_per_mwh"], errors="coerce"
-        ).to_numpy(dtype=float)
-        published = np.isfinite(offtake_price) & np.isfinite(injection_price)
-        # The unpublished tail has no assumed energy value. It remains in the model so
-        # battery physics and grid limits are still enforced without inventing prices.
-        offtake_price = np.where(published, offtake_price, 0.0)
-        injection_price = np.where(published, injection_price, 0.0)
+        numeric_prices = prices.loc[:, PRICE_COLUMNS].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        published_price_steps = int(numeric_prices.notna().all(axis=1).sum())
+        filled_prices, filled_price_steps, reference_days = _fill_unpublished_prices(
+            numeric_prices, context.history, context.at_time
+        )
+        # Missing historical values retain the previous zero-value economic fallback.
+        filled_prices = filled_prices.fillna(0.0)
+        offtake_price = filled_prices[PRICE_COLUMNS[0]].to_numpy(dtype=float)
+        injection_price = filled_prices[PRICE_COLUMNS[1]].to_numpy(dtype=float)
         negative_steps = [
             step
             for step in range(len(forecast))
-            if published[step] and injection_price[step] < 0
+            if injection_price[step] < 0
         ]
         use_milp = self.enforce_negative_price_exclusivity and bool(negative_steps)
 
@@ -359,6 +415,9 @@ class Optimizer:
             "planned_peak_kw": planned_peak,
             "initial_soc": float(context.initial_soc),
             "final_soc": float(energy[-1] / battery.capacity_kwh),
+            "published_price_steps": published_price_steps,
+            "filled_price_steps": filled_price_steps,
+            "price_fallback_reference_day": reference_days,
         }
         return pd.DataFrame(
             {

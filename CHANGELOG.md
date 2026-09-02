@@ -20,5 +20,6 @@
 - Use a temporary MILP to prevent simultaneous battery charging and discharging only when published injection prices are negative.
 - Allow negative-price exclusivity to be disabled so all solves use the reusable LP.
 - Add deterministic incremental monthly peak-capacity cost for current-month horizon steps.
+- Fill unpublished optimizer prices from the nearest historical same-type calendar day.
 - Reuse APPSI HiGHS solver instances for continuous and temporary mixed-integer optimizer solves.
 - Add terminal energy constraint.
