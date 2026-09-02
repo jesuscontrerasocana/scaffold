@@ -405,6 +405,40 @@ def test_price_fallback_does_not_search_older_days_for_missing_slots(
     assert optimizer.last_summary["price_fallback_reference_day"] == "2026-01-05"
 
 
+def test_price_fallback_skips_reference_day_with_no_usable_prices(
+    specs: SiteSpecs,
+) -> None:
+    index = pd.date_range("2026-01-06 10:00", periods=1, freq="15min", tz="UTC")
+    forecast = pd.DataFrame({"net_kw": [0.0]}, index=index)
+    prices = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [np.nan],
+            "injection_price_eur_per_mwh": [np.nan],
+        },
+        index=index,
+    )
+    history = pd.DataFrame(
+        {
+            "offtake_price_eur_per_mwh": [50.0, np.nan],
+            "injection_price_eur_per_mwh": [5.0, np.nan],
+        },
+        index=pd.DatetimeIndex(
+            ["2026-01-02 10:00", "2026-01-05 10:00"], tz="UTC"
+        ),
+    )
+    optimizer = Optimizer(specs)
+
+    optimizer.solve(
+        forecast,
+        prices,
+        _context(index, specs.battery.min_soc, history=history),
+    )
+
+    assert pyo.value(optimizer.model.offtake_price[0]) == 50.0
+    assert pyo.value(optimizer.model.injection_price[0]) == 5.0
+    assert optimizer.last_summary["price_fallback_reference_day"] == "2026-01-02"
+
+
 def test_filled_negative_injection_price_uses_temporary_milp(
     specs: SiteSpecs,
 ) -> None:

@@ -90,28 +90,35 @@ def _fill_unpublished_prices(
 ) -> tuple[pd.DataFrame, int, str]:
     """Fill missing prices from the nearest earlier same-type local calendar day."""
     filled = prices.loc[:, PRICE_COLUMNS].apply(pd.to_numeric, errors="coerce")
-    safe_history = history.loc[history.index < at_time]
+    safe_history = history.loc[: at_time - pd.Timedelta(nanoseconds=1)]
     available_columns = [column for column in PRICE_COLUMNS if column in safe_history]
-    if not available_columns:
+    if not available_columns or safe_history.empty:
         return filled, 0, "unavailable"
 
     references: set[str] = set()
     filled_steps: set[pd.Timestamp] = set()
-    historical_days = safe_history.index.normalize()
-
     for target_day in filled.index.normalize().unique():
-        candidate_days = historical_days[
-            (historical_days < target_day)
-            & ((historical_days.weekday >= 5) == (target_day.weekday() >= 5))
-        ]
-        if candidate_days.empty:
+        target_is_weekend = target_day.weekday() >= 5
+        earliest_day = safe_history.index[0].normalize()
+        reference_day = target_day - pd.DateOffset(days=1)
+        reference_prices = pd.DataFrame()
+
+        while reference_day >= earliest_day:
+            if (reference_day.weekday() >= 5) == target_is_weekend:
+                next_day = reference_day + pd.DateOffset(days=1)
+                candidate_prices = safe_history.loc[
+                    reference_day : next_day - pd.Timedelta(nanoseconds=1),
+                    available_columns,
+                ].apply(pd.to_numeric, errors="coerce")
+                if candidate_prices.notna().any().any():
+                    reference_prices = candidate_prices
+                    break
+            reference_day -= pd.DateOffset(days=1)
+
+        if reference_prices.empty:
             continue
 
-        reference_day = candidate_days.max()
         references.add(str(reference_day.date()))
-        reference_prices = safe_history.loc[
-            historical_days == reference_day, available_columns
-        ].apply(pd.to_numeric, errors="coerce")
         target_timestamps = filled.index[filled.index.normalize() == target_day]
 
         for column in available_columns:
