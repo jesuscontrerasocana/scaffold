@@ -95,37 +95,39 @@ def _fill_unpublished_prices(
     if not available_columns:
         return filled, 0, "unavailable"
 
-    historical = safe_history.loc[:, available_columns].apply(
-        pd.to_numeric, errors="coerce"
-    ).sort_index()
     references: set[str] = set()
     filled_steps: set[pd.Timestamp] = set()
+    historical_days = safe_history.index.normalize()
 
     for target_day in filled.index.normalize().unique():
-        eligible = (
-            (historical.index.normalize() < target_day)
-            & ((historical.index.weekday >= 5) == (target_day.weekday() >= 5))
-        )
+        candidate_days = historical_days[
+            (historical_days < target_day)
+            & ((historical_days.weekday >= 5) == (target_day.weekday() >= 5))
+        ]
+        if candidate_days.empty:
+            continue
+
+        reference_day = candidate_days.max()
+        references.add(str(reference_day.date()))
+        reference_prices = safe_history.loc[
+            historical_days == reference_day, available_columns
+        ].apply(pd.to_numeric, errors="coerce")
         target_timestamps = filled.index[filled.index.normalize() == target_day]
+
         for column in available_columns:
-            candidates = historical.loc[eligible, column].dropna()
-            latest_by_slot = candidates.groupby(
-                [candidates.index.hour, candidates.index.minute]
-            ).tail(1)
-            lookup = {
-                (timestamp.hour, timestamp.minute): (value, timestamp.date())
-                for timestamp, value in latest_by_slot.items()
+            values_by_slot = {
+                (timestamp.hour, timestamp.minute): value
+                for timestamp, value in reference_prices[column].items()
+                if pd.notna(value)
             }
             for timestamp in target_timestamps:
                 if pd.notna(filled.at[timestamp, column]):
                     continue
-                fallback = lookup.get((timestamp.hour, timestamp.minute))
-                if fallback is None:
+                value = values_by_slot.get((timestamp.hour, timestamp.minute))
+                if value is None:
                     continue
-                value, reference_day = fallback
                 filled.at[timestamp, column] = value
                 filled_steps.add(timestamp)
-                references.add(str(reference_day))
 
     reference_days = ", ".join(sorted(references)) if references else "unavailable"
     return filled, len(filled_steps), reference_days
