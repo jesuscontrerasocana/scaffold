@@ -27,3 +27,4 @@
 - Reuse APPSI HiGHS solver instances for continuous and temporary mixed-integer optimizer solves.
 - Add terminal energy constraint.
 - Add rolling-origin selection across forecast models and calendar lookbacks.
+- Add a configurable soft penalty for the maximum planned import above a safe grid threshold.

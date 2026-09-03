@@ -231,6 +231,77 @@ def test_next_month_import_does_not_increase_current_month_peak(
     assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(0.0)
 
 
+def test_peak_safety_has_no_penalty_below_safe_import(specs: SiteSpecs) -> None:
+    forecast, prices = _inputs([70.0], [0.0])
+    optimizer = Optimizer(specs, peak_safety_margin_kw=20.0)
+
+    optimizer.solve(
+        forecast, prices, _context(forecast.index, specs.battery.max_soc)
+    )
+
+    assert optimizer.last_summary["safe_import_limit_kw"] == 80.0
+    assert optimizer.last_summary["safety_peak_excess_kw"] == pytest.approx(0.0)
+    assert optimizer.last_summary["modeled_peak_safety_cost_eur"] == pytest.approx(0.0)
+
+
+def test_peak_safety_penalty_uses_maximum_excess(specs: SiteSpecs) -> None:
+    battery = dataclasses.replace(specs.battery, discharge_power_kw=0.0)
+    limited_specs = dataclasses.replace(specs, battery=battery)
+    forecast, prices = _inputs([90.0, 95.0], [0.0, 0.0])
+    optimizer = Optimizer(
+        limited_specs,
+        peak_safety_margin_kw=20.0,
+        peak_safety_penalty_eur_per_kw=10.0,
+    )
+
+    optimizer.solve(
+        forecast, prices, _context(forecast.index, battery.max_soc)
+    )
+
+    assert optimizer.last_summary["safety_peak_excess_kw"] == pytest.approx(15.0)
+    assert optimizer.last_summary["modeled_peak_safety_cost_eur"] == pytest.approx(150.0)
+
+
+def test_peak_safety_penalty_keeps_unavoidable_high_load_feasible(
+    specs: SiteSpecs,
+) -> None:
+    battery = dataclasses.replace(specs.battery, discharge_power_kw=0.0)
+    limited_specs = dataclasses.replace(specs, battery=battery)
+    forecast, prices = _inputs([100.0], [0.0])
+    optimizer = Optimizer(limited_specs, peak_safety_margin_kw=20.0)
+
+    schedule = optimizer.solve(
+        forecast, prices, _context(forecast.index, battery.max_soc)
+    )
+
+    assert schedule.iloc[0]["battery_discharge_kw"] == pytest.approx(0.0)
+    assert optimizer.last_summary["solver_termination"] == "optimal"
+    assert optimizer.last_summary["safety_peak_excess_kw"] == pytest.approx(20.0)
+
+
+def test_valuable_dispatch_can_exceed_safe_import(specs: SiteSpecs) -> None:
+    forecast, prices = _inputs([70.0, 80.0], [0.0, 100_000.0])
+    optimizer = Optimizer(
+        specs,
+        peak_safety_margin_kw=20.0,
+        peak_safety_penalty_eur_per_kw=1.0,
+    )
+
+    schedule = optimizer.solve(
+        forecast, prices, _context(forecast.index, specs.battery.min_soc)
+    )
+    first_import = (
+        forecast.iloc[0]["net_kw"]
+        + schedule.iloc[0]["battery_charge_kw"]
+        - schedule.iloc[0]["battery_discharge_kw"]
+    )
+
+    assert first_import > 80.0
+    assert optimizer.last_summary["safety_peak_excess_kw"] == pytest.approx(
+        first_import - 80.0
+    )
+
+
 def test_unpublished_prices_are_not_invented(specs: SiteSpecs) -> None:
     forecast, prices = _inputs([0.0, 0.0], [0.0, np.nan])
     prices.iloc[1, prices.columns.get_loc("injection_price_eur_per_mwh")] = np.nan
