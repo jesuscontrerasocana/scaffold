@@ -188,7 +188,7 @@ class Optimizer:
 
     MAX_HORIZON = 132
     DEFAULT_PEAK_SAFETY_MARGIN_KW = 20.0
-    DEFAULT_PEAK_SAFETY_PENALTY_EUR_PER_KW = 10.0
+    DEFAULT_PEAK_SAFETY_PENALTY_EUR_PER_KW = 0.0
 
     def __init__(
         self,
@@ -292,11 +292,10 @@ class Optimizer:
             self.specs.offtake_limit_kw - self.peak_safety_margin_kw
         )
         model.safety_peak_limit = pyo.Constraint(
-            model.steps,
-            rule=lambda m, step: m.safety_peak_excess
-            >= m.grid_import[step]
-            - safe_import_limit_kw
-            - self.specs.offtake_limit_kw * (1 - m.current_month_step[step]),
+            expr=(
+                model.safety_peak_excess
+                >= model.grid_import[0] - safe_import_limit_kw
+            )
         )
         if negative_steps:
             model.negative_steps = pyo.Set(initialize=negative_steps)
@@ -452,6 +451,12 @@ class Optimizer:
         discharge = np.array([pyo.value(model.discharge[t]) for t in active_steps])
         energy = np.array([pyo.value(model.energy[t]) for t in active_steps])
         planned_peak = float(pyo.value(model.planned_peak))
+        safe_import_limit_kw = (
+            self.specs.offtake_limit_kw - self.peak_safety_margin_kw
+        )
+        safety_peak_excess_kw = max(
+            0.0, float(pyo.value(model.grid_import[0])) - safe_import_limit_kw
+        )
 
         self.last_summary = {
             "solver_termination": termination.name,
@@ -462,14 +467,11 @@ class Optimizer:
             "modeled_peak_cost_eur": float(
                 pyo.value(model.incremental_peak_cost)
             ),
-            "safe_import_limit_kw": (
-                self.specs.offtake_limit_kw - self.peak_safety_margin_kw
-            ),
-            "safety_peak_excess_kw": float(
-                pyo.value(model.safety_peak_excess)
-            ),
-            "modeled_peak_safety_cost_eur": float(
-                pyo.value(model.peak_safety_cost)
+            "safe_import_limit_kw": safe_import_limit_kw,
+            "safety_peak_excess_kw": safety_peak_excess_kw,
+            "modeled_peak_safety_cost_eur": (
+                self.peak_safety_penalty_eur_per_kw
+                * safety_peak_excess_kw
             ),
             "past_month_peak_kw": past_month_peak,
             "planned_peak_kw": planned_peak,
