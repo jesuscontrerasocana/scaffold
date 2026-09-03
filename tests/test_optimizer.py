@@ -7,6 +7,7 @@ import pandas as pd
 import pyomo.environ as pyo
 import pytest
 
+import pipeline.optimizer as optimizer_module
 from pipeline.data import HOURS_PER_STEP
 from pipeline.harness import DecisionContext, MonthState
 from pipeline.optimizer import Optimizer
@@ -66,6 +67,18 @@ def _energy(schedule: pd.DataFrame, specs: SiteSpecs, initial_soc: float) -> np.
         - schedule["battery_discharge_kw"] / eta
     )
     return initial_soc * specs.battery.capacity_kwh + changes.cumsum().to_numpy()
+
+
+def _planned_peak(optimizer: Optimizer) -> float:
+    current_month_imports = [
+        pyo.value(optimizer.model.grid_import[step])
+        for step in optimizer.model.steps
+        if pyo.value(optimizer.model.current_month_step[step]) == 1
+    ]
+    return max(
+        pyo.value(optimizer.model.past_month_peak),
+        max(current_month_imports, default=0.0),
+    )
 
 
 def test_feasible_dispatch_respects_physics_and_balance(specs: SiteSpecs) -> None:
@@ -145,7 +158,7 @@ def test_import_below_past_peak_has_no_incremental_peak_cost(specs: SiteSpecs) -
     )
 
     assert optimizer.last_summary["past_month_peak_kw"] == 50.0
-    assert optimizer.last_summary["planned_peak_kw"] == pytest.approx(50.0)
+    assert _planned_peak(optimizer) == pytest.approx(50.0)
     assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(0.0)
 
 
@@ -159,10 +172,9 @@ def test_import_above_past_peak_uses_site_peak_tariff(specs: SiteSpecs) -> None:
         _context(forecast.index, specs.battery.min_soc, peak_offtake_kw=50.0),
     )
 
-    assert optimizer.last_summary["planned_peak_kw"] == pytest.approx(60.0)
+    assert _planned_peak(optimizer) == pytest.approx(60.0)
     incremental_peak_kw = (
-        optimizer.last_summary["planned_peak_kw"]
-        - optimizer.last_summary["past_month_peak_kw"]
+        _planned_peak(optimizer) - optimizer.last_summary["past_month_peak_kw"]
     )
     assert incremental_peak_kw == pytest.approx(10.0)
     assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(
@@ -182,8 +194,74 @@ def test_battery_discharge_avoids_new_peak(specs: SiteSpecs) -> None:
 
     grid_import = 100.0 - schedule.iloc[0]["battery_discharge_kw"]
     assert grid_import == pytest.approx(50.0)
-    assert optimizer.last_summary["planned_peak_kw"] == pytest.approx(50.0)
+    assert _planned_peak(optimizer) == pytest.approx(50.0)
     assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(0.0)
+
+
+def test_zero_peak_safety_margin_preserves_dispatch(specs: SiteSpecs) -> None:
+    forecast, prices = _inputs([30.0], [-100.0])
+    context = _context(forecast.index, 0.5, peak_offtake_kw=50.0)
+
+    current = Optimizer(specs).solve(forecast, prices, context)
+    explicit_zero = Optimizer(specs, peak_safety_margin_kw=0.0).solve(
+        forecast, prices, context
+    )
+
+    pd.testing.assert_frame_equal(current, explicit_zero)
+
+
+def test_peak_safety_margin_reserves_headroom(specs: SiteSpecs) -> None:
+    forecast, prices = _inputs([30.0] * 132, [0.0] + [1_000.0] * 131)
+    optimizer = Optimizer(specs, peak_safety_margin_kw=10.0)
+
+    schedule = optimizer.solve(
+        forecast, prices, _context(forecast.index, 0.5, peak_offtake_kw=50.0)
+    )
+
+    planned_import = forecast.iloc[0]["net_kw"] + schedule.iloc[0][
+        "battery_charge_kw"
+    ] - schedule.iloc[0]["battery_discharge_kw"]
+    assert planned_import == pytest.approx(40.0)
+    assert _planned_peak(optimizer) == pytest.approx(50.0)
+    assert pyo.value(optimizer.model.planned_peak) == pytest.approx(50.0)
+    assert pyo.value(optimizer.model.peak_safety_margin) == 10.0
+
+
+def test_peak_safety_margin_does_not_make_high_load_infeasible(
+    specs: SiteSpecs,
+) -> None:
+    battery = dataclasses.replace(specs.battery, discharge_power_kw=0.0)
+    limited_specs = dataclasses.replace(specs, battery=battery)
+    forecast, prices = _inputs([60.0], [0.0])
+    optimizer = Optimizer(limited_specs, peak_safety_margin_kw=10.0)
+
+    schedule = optimizer.solve(
+        forecast,
+        prices,
+        _context(forecast.index, battery.max_soc, peak_offtake_kw=50.0),
+    )
+
+    assert schedule.iloc[0]["battery_discharge_kw"] == pytest.approx(0.0)
+    assert _planned_peak(optimizer) == pytest.approx(60.0)
+    assert pyo.value(optimizer.model.planned_peak) == pytest.approx(70.0)
+
+
+def test_peak_safety_margin_allows_economic_new_peak(specs: SiteSpecs) -> None:
+    forecast, prices = _inputs([30.0] * 132, [0.0] + [100_000.0] * 131)
+    optimizer = Optimizer(specs, peak_safety_margin_kw=10.0)
+
+    schedule = optimizer.solve(
+        forecast, prices, _context(forecast.index, 0.5, peak_offtake_kw=50.0)
+    )
+
+    planned_import = forecast.iloc[0]["net_kw"] + schedule.iloc[0][
+        "battery_charge_kw"
+    ] - schedule.iloc[0]["battery_discharge_kw"]
+    assert planned_import > 50.0
+    assert _planned_peak(optimizer) == pytest.approx(planned_import)
+    assert pyo.value(optimizer.model.planned_peak) == pytest.approx(
+        planned_import + 10.0
+    )
 
 
 def test_dispatch_below_past_peak_receives_no_credit(specs: SiteSpecs) -> None:
@@ -196,10 +274,9 @@ def test_dispatch_below_past_peak_receives_no_credit(specs: SiteSpecs) -> None:
         _context(forecast.index, specs.battery.max_soc, peak_offtake_kw=50.0),
     )
 
-    assert optimizer.last_summary["planned_peak_kw"] == pytest.approx(50.0)
+    assert _planned_peak(optimizer) == pytest.approx(50.0)
     incremental_peak_kw = (
-        optimizer.last_summary["planned_peak_kw"]
-        - optimizer.last_summary["past_month_peak_kw"]
+        _planned_peak(optimizer) - optimizer.last_summary["past_month_peak_kw"]
     )
     assert incremental_peak_kw == pytest.approx(0.0)
     assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(0.0)
@@ -227,7 +304,7 @@ def test_next_month_import_does_not_increase_current_month_peak(
         _context(index, specs.battery.min_soc, peak_offtake_kw=50.0),
     )
 
-    assert optimizer.last_summary["planned_peak_kw"] == pytest.approx(50.0)
+    assert _planned_peak(optimizer) == pytest.approx(50.0)
     assert optimizer.last_summary["modeled_peak_cost_eur"] == pytest.approx(0.0)
 
 

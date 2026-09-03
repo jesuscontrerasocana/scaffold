@@ -192,11 +192,13 @@ class Optimizer:
         self,
         specs: SiteSpecs,
         enforce_negative_price_exclusivity: bool = False,
+        peak_safety_margin_kw: float = 0.0,
     ) -> None:
         self.specs = specs
         self.enforce_negative_price_exclusivity = (
             enforce_negative_price_exclusivity
         )
+        self.peak_safety_margin_kw = float(peak_safety_margin_kw)
         self.last_summary: dict[str, float | int | str] = {}
         self.model = self._build_model(self.MAX_HORIZON)
         self.lp_solver = Highs()
@@ -225,6 +227,7 @@ class Optimizer:
         )
         model.initial_energy = pyo.Param(mutable=True, initialize=0.0)
         model.past_month_peak = pyo.Param(mutable=True, initialize=0.0)
+        model.peak_safety_margin = pyo.Param(initialize=self.peak_safety_margin_kw)
         model.charge = pyo.Var(
             model.steps, bounds=(0.0, battery.charge_power_kw)
         )
@@ -263,6 +266,7 @@ class Optimizer:
             model.steps,
             rule=lambda m, step: m.planned_peak
             >= m.grid_import[step]
+            + m.peak_safety_margin * m.current_month_step[step]
             - self.specs.offtake_limit_kw * (1 - m.current_month_step[step]),
         )
         if negative_steps:
@@ -370,7 +374,6 @@ class Optimizer:
         use_milp = self.enforce_negative_price_exclusivity and bool(negative_steps)
 
         battery = self.specs.battery
-        eta = battery.one_way_efficiency
         minimum_energy = battery.capacity_kwh * battery.min_soc
         maximum_energy = battery.capacity_kwh * battery.max_soc
         initial_energy = battery.capacity_kwh * context.initial_soc
@@ -411,7 +414,6 @@ class Optimizer:
         charge = np.array([pyo.value(model.charge[t]) for t in active_steps])
         discharge = np.array([pyo.value(model.discharge[t]) for t in active_steps])
         energy = np.array([pyo.value(model.energy[t]) for t in active_steps])
-        planned_peak = float(pyo.value(model.planned_peak))
 
         self.last_summary = {
             "solver_termination": termination.name,
@@ -423,7 +425,6 @@ class Optimizer:
                 pyo.value(model.incremental_peak_cost)
             ),
             "past_month_peak_kw": past_month_peak,
-            "planned_peak_kw": planned_peak,
             "initial_soc": float(context.initial_soc),
             "final_soc": float(energy[-1] / battery.capacity_kwh),
             "published_price_steps": published_price_steps,
