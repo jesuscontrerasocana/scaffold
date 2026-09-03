@@ -26,3 +26,4 @@
 - Precompute original-feature Ridge weights and intercepts for forecast inference.
 - Reuse APPSI HiGHS solver instances for continuous and temporary mixed-integer optimizer solves.
 - Add terminal energy constraint.
+- Add rolling-origin selection across forecast models and calendar lookbacks.
