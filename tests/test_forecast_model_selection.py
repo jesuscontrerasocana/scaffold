@@ -133,3 +133,47 @@ def test_run_selection_passes_model_and_writes_fold_and_aggregate_rows(
     assert aggregate[["model", "lookback", "n_folds"]].to_dict("records") == [
         {"model": "ridge", "lookback": "1m", "n_folds": 1}
     ]
+
+
+def test_fold_data_includes_full_horizon_after_validation_month(monkeypatch) -> None:
+    index = pd.date_range(
+        "2026-03-01", "2026-05-01 00:45", freq="15min", tz=TZ
+    )
+    data = pd.DataFrame({"grid_net_kw": 1.0}, index=index)
+    seen: dict[str, object] = {}
+
+    class FakeForecaster:
+        def __init__(self, specs, model_name):  # noqa: ANN001, ARG002
+            pass
+
+        def fit(self, history):  # noqa: ANN001, ARG002
+            pass
+
+    def fake_collect(fold_data, forecaster, config):  # noqa: ANN001, ARG001
+        seen["data_end"] = fold_data.index[-1]
+        seen["last_decision"] = config.last_decision
+        comparisons = pd.DataFrame(
+            {
+                "lead_steps": [1, 4],
+                "actual_kw": [1.0, 1.0],
+                "predicted_kw": [1.0, 1.0],
+            }
+        )
+        comparisons.attrs.update(forecast_seconds=0.1, n_decisions=1)
+        return comparisons
+
+    monkeypatch.setattr(selection, "Forecaster", FakeForecaster)
+    monkeypatch.setattr(selection, "collect_forecasts", fake_collect)
+
+    selection.run_selection(
+        data,
+        object(),
+        [pd.Timestamp("2026-04-01", tz=TZ)],
+        ["ridge"],
+        ["1m"],
+        horizon_steps=4,
+        decision_interval_minutes=15,
+    )
+
+    assert seen["last_decision"] == pd.Timestamp("2026-04-30 23:45", tz=TZ)
+    assert seen["data_end"] == pd.Timestamp("2026-05-01 00:30", tz=TZ)

@@ -185,10 +185,11 @@ def run_selection(
                         f"No training data for {model_name} + {lookback} before "
                         f"{validation_start:%Y-%m}"
                     )
-                fold_data = data.loc[data.index < next_month]
-                last_decision = min(validation_end, fold_data.index[-1])
+                horizon_span = (horizon_steps - 1) * STEP
+                last_decision = min(validation_end, data.index[-1] - horizon_span)
                 if last_decision < validation_start:
                     raise ValueError(f"No validation data for {validation_start:%Y-%m}")
+                fold_data = data.loc[data.index <= last_decision + horizon_span]
 
                 forecaster = Forecaster(specs, model_name=model_name)
                 started = time.perf_counter()
