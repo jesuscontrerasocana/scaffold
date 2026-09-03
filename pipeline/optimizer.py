@@ -194,8 +194,6 @@ class Optimizer:
         enforce_negative_price_exclusivity: bool = False,
         peak_safety_margin_kw: float = 0.0,
     ) -> None:
-        if not np.isfinite(peak_safety_margin_kw) or peak_safety_margin_kw < 0:
-            raise ValueError("Peak safety margin must be a finite non-negative value")
         self.specs = specs
         self.enforce_negative_price_exclusivity = (
             enforce_negative_price_exclusivity
@@ -229,7 +227,7 @@ class Optimizer:
         )
         model.initial_energy = pyo.Param(mutable=True, initialize=0.0)
         model.past_month_peak = pyo.Param(mutable=True, initialize=0.0)
-        model.peak_safety_margin = pyo.Param(mutable=True, initialize=0.0)
+        model.peak_safety_margin = pyo.Param(initialize=self.peak_safety_margin_kw)
         model.charge = pyo.Var(
             model.steps, bounds=(0.0, battery.charge_power_kw)
         )
@@ -245,12 +243,7 @@ class Optimizer:
         model.grid_export = pyo.Var(
             model.steps, bounds=(0.0, self.specs.injection_limit_kw)
         )
-        model.planned_peak = pyo.Var(
-            bounds=(
-                0.0,
-                self.specs.offtake_limit_kw + self.peak_safety_margin_kw,
-            )
-        )
+        model.planned_peak = pyo.Var(bounds=(0.0, self.specs.offtake_limit_kw))
 
         def energy_balance(m: pyo.ConcreteModel, step: int) -> pyo.Constraint:
             previous = m.initial_energy if step == 0 else m.energy[step - 1]
@@ -381,16 +374,12 @@ class Optimizer:
         use_milp = self.enforce_negative_price_exclusivity and bool(negative_steps)
 
         battery = self.specs.battery
-        eta = battery.one_way_efficiency
         minimum_energy = battery.capacity_kwh * battery.min_soc
         maximum_energy = battery.capacity_kwh * battery.max_soc
         initial_energy = battery.capacity_kwh * context.initial_soc
         if not minimum_energy <= initial_energy <= maximum_energy:
             raise ValueError("Initial state of charge is outside battery bounds")
         past_month_peak = float(context.month.peak_offtake_kw)
-        applied_peak_safety_margin = min(
-            self.peak_safety_margin_kw, past_month_peak
-        )
 
         model = (
             self._build_model(len(forecast), negative_steps=negative_steps)
@@ -413,7 +402,6 @@ class Optimizer:
             )
         model.initial_energy.set_value(initial_energy)
         model.past_month_peak.set_value(past_month_peak)
-        model.peak_safety_margin.set_value(applied_peak_safety_margin)
 
         solver = self.milp_solver if use_milp else self.lp_solver
         result = solver.solve(model)
@@ -426,13 +414,6 @@ class Optimizer:
         charge = np.array([pyo.value(model.charge[t]) for t in active_steps])
         discharge = np.array([pyo.value(model.discharge[t]) for t in active_steps])
         energy = np.array([pyo.value(model.energy[t]) for t in active_steps])
-        risk_adjusted_peak = float(pyo.value(model.planned_peak))
-        current_month_imports = [
-            float(pyo.value(model.grid_import[step]))
-            for step in active_steps
-            if pyo.value(model.current_month_step[step]) == 1
-        ]
-        planned_peak = max([past_month_peak, *current_month_imports])
 
         self.last_summary = {
             "solver_termination": termination.name,
@@ -445,9 +426,6 @@ class Optimizer:
             ),
             "past_month_peak_kw": past_month_peak,
             "planned_peak_kw": planned_peak,
-            "risk_adjusted_peak_kw": risk_adjusted_peak,
-            "peak_safety_margin_kw": self.peak_safety_margin_kw,
-            "applied_peak_safety_margin_kw": applied_peak_safety_margin,
             "initial_soc": float(context.initial_soc),
             "final_soc": float(energy[-1] / battery.capacity_kwh),
             "published_price_steps": published_price_steps,
