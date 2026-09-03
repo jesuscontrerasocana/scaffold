@@ -19,12 +19,43 @@ def _plt():  # noqa: ANN202
     return plt
 
 
+def _figure(rows: int):  # noqa: ANN202
+    plt = _plt()
+    return plt, plt.subplots(rows, 1, figsize=(14, 3 * rows), sharex=True)
+
+
 def _peak_rate(summary: dict[str, Any]) -> float:
     for item in summary.get("peak_cost_detail", {}).values():
         peak, share = float(item["peak_offtake_kw"]), float(item["month_share"])
         if peak > 0 and share > 0:
             return float(item["peak_cost_eur"]) / (peak * share)
     return 0.0
+
+
+def _running_peak_cost(
+    data: pd.DataFrame,
+    import_column: str,
+    summary: dict[str, Any],
+    rate: float,
+) -> pd.Series:
+    """Apply the harness's monthly peak proration as each month progresses."""
+    result = pd.Series(index=data.index, dtype=float)
+    billed_before_month = 0.0
+    months = pd.PeriodIndex(data.index.tz_localize(None), freq="M")
+    details = summary.get("peak_cost_detail", {})
+    for period, group in data.groupby(months):
+        detail = details.get(str(period), {})
+        final_share = float(detail.get("month_share", 1.0))
+        steps_in_month = len(group) / final_share if final_share > 0 else len(group)
+        elapsed_share = pd.Series(
+            range(1, len(group) + 1), index=group.index, dtype=float
+        ) / steps_in_month
+        current_month_cost = (
+            group[import_column].cummax() * rate * elapsed_share
+        )
+        result.loc[group.index] = billed_before_month + current_month_cost
+        billed_before_month = float(result.loc[group.index].iloc[-1])
+    return result
 
 
 def calculate_dashboard_metrics(
@@ -49,14 +80,16 @@ def calculate_dashboard_metrics(
     rate = _peak_rate(summary)
     for name in ("without_bess", "with_bess"):
         data[f"running_peak_{name}_kw"] = data[f"grid_import_{name}_kw"].cummax()
-        data[f"running_peak_cost_{name}_eur"] = data[f"running_peak_{name}_kw"] * rate
+        data[f"running_peak_cost_{name}_eur"] = _running_peak_cost(
+            data, f"grid_import_{name}_kw", summary, rate
+        )
     data["cumulative_bill_without_bess_eur"] = data["energy_cost_without_bess_eur"].cumsum() + data["running_peak_cost_without_bess_eur"]
     data["cumulative_bill_with_bess_eur"] = data["energy_cost_with_bess_eur"].cumsum() + data["running_peak_cost_with_bess_eur"] + data["cycling_cost_eur"].cumsum()
 
     energy_without = float(data["energy_cost_without_bess_eur"].sum())
     energy_with = float(data["energy_cost_with_bess_eur"].sum())
-    peak_without = float(data["grid_import_without_bess_kw"].max()) * rate
-    peak_with = float(data["grid_import_with_bess_kw"].max()) * rate
+    peak_without = float(data["running_peak_cost_without_bess_eur"].iloc[-1])
+    peak_with = float(data["running_peak_cost_with_bess_eur"].iloc[-1])
     bill_without = energy_without + peak_without
     bill_with = energy_with + peak_with + cycling_cost
     savings = bill_without - bill_with
@@ -94,22 +127,73 @@ def write_results(schedule: pd.DataFrame, summary: dict[str, Any], out_path: Pat
 
 def _plot_simulation(schedule: pd.DataFrame, summary: dict[str, Any], path: Path) -> None:
     try:
-        plt = _plt()
+        plt, (fig, axes) = _figure(4)
     except ImportError:
         return
-    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
+
     window = schedule.iloc[: 96 * 7]
-    axes[0].plot(window.index, window["realized_net_no_bess_kw"], label="site, no battery")
-    axes[0].plot(window.index, window["grid_net_with_bess_kw"], label="meter, with battery")
-    axes[1].plot(window.index, window["realized_net_no_bess_kw"], label="realized")
-    axes[1].plot(window.index, window["forecast_net_kw"], label="forecast")
-    axes[2].plot(window.index, window["applied_charge_kw"], label="charge")
-    axes[2].plot(window.index, -window["applied_discharge_kw"], label="discharge")
-    axes[3].plot(window.index, window["offtake_price_eur_per_mwh"], label="offtake EUR/MWh")
-    axes[3].plot(window.index, window["injection_price_eur_per_mwh"], label="injection EUR/MWh")
+    peak = max(v["peak_offtake_kw"] for v in summary["peak_cost_detail"].values())
+
+    axes[0].plot(
+        window.index, window["realized_net_no_bess_kw"], label="site, no battery", lw=1
+    )
+    axes[0].plot(
+        window.index,
+        window["grid_net_with_bess_kw"],
+        label="at the meter, with battery",
+        lw=1.2,
+    )
+    axes[0].axhline(
+        peak, color="crimson", ls="--", lw=1, label=f"month peak {peak:.0f} kW"
+    )
+    axes[0].axhline(0, color="grey", lw=0.5)
+    axes[0].set_ylabel("kW")
+    axes[0].set_title("First week of the simulation")
+
+    axes[1].plot(
+        window.index, window["realized_net_no_bess_kw"], label="realized", lw=1
+    )
+    axes[1].plot(
+        window.index, window["forecast_net_kw"], label="forecast", lw=1, alpha=0.8
+    )
+    axes[1].set_ylabel("kW")
+
+    axes[2].fill_between(
+        window.index, 0, window["applied_charge_kw"], label="charge", alpha=0.7
+    )
+    axes[2].fill_between(
+        window.index, 0, -window["applied_discharge_kw"], label="discharge", alpha=0.7
+    )
+    ax_soc = axes[2].twinx()
+    ax_soc.plot(
+        window.index, window["soc"], color="black", lw=1, label="state of charge"
+    )
+    ax_soc.set_ylim(0, 1)
+    ax_soc.set_ylabel("state of charge")
+    axes[2].set_ylabel("kW")
+
+    axes[3].plot(
+        window.index, window["offtake_price_eur_per_mwh"], label="offtake EUR/MWh", lw=1
+    )
+    axes[3].plot(
+        window.index,
+        window["injection_price_eur_per_mwh"],
+        label="injection EUR/MWh",
+        lw=1,
+    )
+    axes[3].axhline(0, color="grey", lw=0.5)
+    axes[3].set_ylabel("EUR/MWh")
+
     for ax in axes:
-        ax.legend(fontsize=8); ax.grid(alpha=.2)
-    fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
+        ax.legend(loc="upper right", fontsize=8)
+    fig.suptitle(
+        f"bill {summary['total_cost_eur']:.0f} EUR "
+        f"= energy {summary['energy_cost_eur']:.0f} + capacity {summary['peak_cost_eur']:.0f} "
+        f"+ cycles {summary['cycle_cost_eur']:.0f}   |   {summary['equivalent_cycles']:.1f} cycles"
+    )
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
 
 
 def _display(value: float | None, unit: str = "") -> str:

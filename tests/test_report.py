@@ -48,6 +48,25 @@ def test_dashboard_bill_arithmetic_reconciles() -> None:
     assert metrics["pv_production_mwh"] is None
 
 
+def test_dashboard_prorates_partial_month_peak_cost() -> None:
+    schedule, summary = _artifacts()
+    month_share = len(schedule) / (30 * 96)
+    detail = summary["peak_cost_detail"]["2026-06"]
+    detail["month_share"] = month_share
+    detail["peak_cost_eur"] = 15.0 * 2.0 * month_share
+
+    metrics, data = calculate_dashboard_metrics(schedule, summary)
+
+    expected_peak_cost = 15.0 * 2.0 * month_share
+    assert metrics["peak_cost_with_bess_eur"] == pytest.approx(expected_peak_cost)
+    assert metrics["bill_with_bess_eur"] == pytest.approx(
+        0.6 + expected_peak_cost + 2.0
+    )
+    assert data["running_peak_cost_with_bess_eur"].iloc[-1] == pytest.approx(
+        expected_peak_cost
+    )
+
+
 def test_write_results_and_standalone_create_dashboard(tmp_path) -> None:
     schedule, summary = _artifacts()
     schedule.attrs["forecast_log"] = pd.DataFrame(
