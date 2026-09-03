@@ -187,16 +187,36 @@ class Optimizer:
     """
 
     MAX_HORIZON = 132
+    DEFAULT_PEAK_SAFETY_MARGIN_KW = 20.0
+    DEFAULT_PEAK_SAFETY_PENALTY_EUR_PER_KW = 100.0
 
     def __init__(
         self,
         specs: SiteSpecs,
         enforce_negative_price_exclusivity: bool = False,
+        peak_safety_margin_kw: float | None = None,
+        peak_safety_penalty_eur_per_kw: float | None = None,
     ) -> None:
         self.specs = specs
         self.enforce_negative_price_exclusivity = (
             enforce_negative_price_exclusivity
         )
+        self.peak_safety_margin_kw = float(
+            self.DEFAULT_PEAK_SAFETY_MARGIN_KW
+            if peak_safety_margin_kw is None
+            else peak_safety_margin_kw
+        )
+        self.peak_safety_penalty_eur_per_kw = float(
+            self.DEFAULT_PEAK_SAFETY_PENALTY_EUR_PER_KW
+            if peak_safety_penalty_eur_per_kw is None
+            else peak_safety_penalty_eur_per_kw
+        )
+        if self.peak_safety_margin_kw < 0:
+            raise ValueError("Peak safety margin cannot be negative")
+        if self.peak_safety_margin_kw > self.specs.offtake_limit_kw:
+            raise ValueError("Peak safety margin cannot exceed the offtake limit")
+        if self.peak_safety_penalty_eur_per_kw < 0:
+            raise ValueError("Peak safety penalty cannot be negative")
         self.last_summary: dict[str, float | int | str] = {}
         self.model = self._build_model(self.MAX_HORIZON)
         self.lp_solver = Highs()
@@ -223,6 +243,9 @@ class Optimizer:
         model.current_month_step = pyo.Param(
             model.steps, mutable=True, within=pyo.Binary, initialize=0
         )
+        model.active_step = pyo.Param(
+            model.steps, mutable=True, within=pyo.Binary, initialize=0
+        )
         model.initial_energy = pyo.Param(mutable=True, initialize=0.0)
         model.past_month_peak = pyo.Param(mutable=True, initialize=0.0)
         model.charge = pyo.Var(
@@ -241,6 +264,10 @@ class Optimizer:
             model.steps, bounds=(0.0, self.specs.injection_limit_kw)
         )
         model.planned_peak = pyo.Var(bounds=(0.0, self.specs.offtake_limit_kw))
+        model.safety_excess = pyo.Var(
+            model.steps,
+            bounds=(0.0, self.peak_safety_margin_kw)
+        )
 
         def energy_balance(m: pyo.ConcreteModel, step: int) -> pyo.Constraint:
             previous = m.initial_energy if step == 0 else m.energy[step - 1]
@@ -264,6 +291,16 @@ class Optimizer:
             rule=lambda m, step: m.planned_peak
             >= m.grid_import[step]
             - self.specs.offtake_limit_kw * (1 - m.current_month_step[step]),
+        )
+        safe_import_limit_kw = (
+            self.specs.offtake_limit_kw - self.peak_safety_margin_kw
+        )
+        model.safety_peak_limit = pyo.Constraint(
+            model.steps,
+            rule=lambda m, step: m.safety_excess[step]
+            >= m.grid_import[step]
+            - safe_import_limit_kw
+            - self.specs.offtake_limit_kw * (1 - m.active_step[step]),
         )
         if negative_steps:
             model.negative_steps = pyo.Set(initialize=negative_steps)
@@ -308,11 +345,18 @@ class Optimizer:
             expr=self.specs.offtake_monthly_peak_cost_eur_per_kw
             * (model.planned_peak - model.past_month_peak)
         )
+        model.peak_safety_cost = pyo.Expression(
+            expr=(
+                self.peak_safety_penalty_eur_per_kw
+                * sum(model.safety_excess[step] for step in model.steps)
+            )
+        )
         model.objective = pyo.Objective(
             expr=(
                 model.energy_cost
                 + model.degradation_cost
                 + model.incremental_peak_cost
+                + model.peak_safety_cost
             ),
             sense=pyo.minimize,
         )
@@ -388,10 +432,12 @@ class Optimizer:
             model.offtake_price[step] = 0.0
             model.injection_price[step] = 0.0
             model.current_month_step[step] = 0
+            model.active_step[step] = 0
         for step in range(len(forecast)):
             model.net_kw[step] = net[step]
             model.offtake_price[step] = offtake_price[step]
             model.injection_price[step] = injection_price[step]
+            model.active_step[step] = 1
             timestamp = forecast.index[step]
             model.current_month_step[step] = int(
                 timestamp.year == context.at_time.year
@@ -412,6 +458,16 @@ class Optimizer:
         discharge = np.array([pyo.value(model.discharge[t]) for t in active_steps])
         energy = np.array([pyo.value(model.energy[t]) for t in active_steps])
         planned_peak = float(pyo.value(model.planned_peak))
+        safe_import_limit_kw = (
+            self.specs.offtake_limit_kw - self.peak_safety_margin_kw
+        )
+        safety_peak_excess_kw = sum(
+            max(
+                0.0,
+                float(pyo.value(model.grid_import[step])) - safe_import_limit_kw,
+            )
+            for step in active_steps
+        )
 
         self.last_summary = {
             "solver_termination": termination.name,
@@ -421,6 +477,12 @@ class Optimizer:
             "degradation_cost_eur": float(pyo.value(model.degradation_cost)),
             "modeled_peak_cost_eur": float(
                 pyo.value(model.incremental_peak_cost)
+            ),
+            "safe_import_limit_kw": safe_import_limit_kw,
+            "safety_peak_excess_kw": safety_peak_excess_kw,
+            "modeled_peak_safety_cost_eur": (
+                self.peak_safety_penalty_eur_per_kw
+                * safety_peak_excess_kw
             ),
             "past_month_peak_kw": past_month_peak,
             "planned_peak_kw": planned_peak,
