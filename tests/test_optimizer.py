@@ -669,3 +669,28 @@ def test_terminal_energy_is_at_least_half_capacity(specs: SiteSpecs) -> None:
     maximum_energy = specs.battery.capacity_kwh * specs.battery.max_soc
 
     assert terminal_energy >= 0.5 * maximum_energy - 1e-6
+
+
+def test_model_defines_cycles_from_battery_throughput(specs: SiteSpecs) -> None:
+    horizon_steps = 4
+    model = Optimizer(specs)._build_model(horizon_steps)
+    expected_upper_bound = (
+        1.5 *horizon_steps
+        * specs.battery.n_cycles_per_year
+        / (365 * 24 * (1 / HOURS_PER_STEP))
+    )
+
+    for step in model.steps:
+        model.charge[step].set_value(10.0)
+        model.discharge[step].set_value(5.0)
+    expected_cycles = (
+        HOURS_PER_STEP
+        * horizon_steps
+        * (10.0 + 5.0)
+        / specs.battery.capacity_kwh
+    )
+    model.cycles.set_value(expected_cycles)
+
+    assert model.cycles.lb == 0.0
+    assert model.cycles.ub == pytest.approx(expected_upper_bound)
+    assert pyo.value(model.cycles_definition.body) == pytest.approx(0.0)

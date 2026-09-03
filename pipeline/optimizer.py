@@ -241,6 +241,12 @@ class Optimizer:
             model.steps, bounds=(0.0, self.specs.injection_limit_kw)
         )
         model.planned_peak = pyo.Var(bounds=(0.0, self.specs.offtake_limit_kw))
+        maximum_cycles = (
+            1.5* horizon_steps
+            * battery.n_cycles_per_year
+            / (365 * 24 * (1 / HOURS_PER_STEP))
+        )
+        model.cycles = pyo.Var(bounds=(0.0, maximum_cycles))
 
         def energy_balance(m: pyo.ConcreteModel, step: int) -> pyo.Constraint:
             previous = m.initial_energy if step == 0 else m.energy[step - 1]
@@ -249,6 +255,15 @@ class Optimizer:
             )
 
         model.energy_balance = pyo.Constraint(model.steps, rule=energy_balance)
+        model.cycles_definition = pyo.Constraint(
+            expr=model.cycles
+            == HOURS_PER_STEP
+            * sum(
+                model.charge[step] + model.discharge[step]
+                for step in model.steps
+            )
+            / battery.capacity_kwh
+        )
 
         model.terminal_energy = pyo.Constraint(expr=model.energy[horizon_steps - 1] >= 0.5 * maximum_energy)
         model.grid_balance = pyo.Constraint(
