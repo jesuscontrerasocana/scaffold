@@ -27,3 +27,4 @@
 - Reuse APPSI HiGHS solver instances for continuous and temporary mixed-integer optimizer solves.
 - Add terminal energy constraint.
 - Add rolling-origin selection across forecast models and calendar lookbacks.
+- Add configurable peak headroom for forecast error during battery optimization.
