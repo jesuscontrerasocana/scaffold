@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -76,6 +77,8 @@ def collect_forecasts(
     """Roll through decision times using the harness information boundary."""
 
     rows: list[pd.DataFrame] = []
+    forecast_seconds = 0.0
+    n_decisions = 0
     for at_time in decision_times(data.index, config):
         if at_time.minute == 0 and at_time.hour == 0:
             print(at_time)
@@ -94,12 +97,15 @@ def collect_forecasts(
         future_exog = data.loc[horizon_index, EXOG_COLUMNS].copy()
         future_exog[PRICE_COLUMNS] = prices
 
+        started = time.perf_counter()
         forecast = forecaster.predict(
             at_time=at_time,
             history=history,
             future_exog=future_exog,
             horizon=len(horizon_index),
         ).reindex(horizon_index)
+        forecast_seconds += time.perf_counter() - started
+        n_decisions += 1
         if FORECAST_COL not in forecast:
             raise ValueError(f"Forecaster output is missing '{FORECAST_COL}'")
         if forecast[FORECAST_COL].isna().any():
@@ -136,7 +142,10 @@ def collect_forecasts(
 
     if not rows:
         raise ValueError("No forecasts were produced for the requested window")
-    return pd.concat(rows, ignore_index=True)
+    comparisons = pd.concat(rows, ignore_index=True)
+    comparisons.attrs["forecast_seconds"] = forecast_seconds
+    comparisons.attrs["n_decisions"] = n_decisions
+    return comparisons
 
 
 def lead_metrics(comparisons: pd.DataFrame) -> pd.DataFrame:
