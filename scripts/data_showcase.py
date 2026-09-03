@@ -7,6 +7,62 @@ import pandas as pd
 DATA_PATH = Path("data/history.csv")
 OUT_DIR = Path("out/data_figures")
 
+OFFTAKE_PEAK_COST_EUR_PER_KW = 4.25
+HOURS_PER_STEP = 0.25
+
+def plot_monthly_bill(monthly_bills: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(8, 4))
+
+    ax.bar(
+        monthly_bills[1:-1].index.astype(str),
+        monthly_bills[1:-1]["total_bill_eur"],
+    )
+
+    ax.set_ylabel("Total bill [€]")
+    ax.set_title("Monthly electricity bill without battery")
+    ax.tick_params(axis="x", rotation=45)
+
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / "05_monthly_bill.png", dpi=180)
+    plt.close(fig)
+
+def calculate_monthly_bills(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy()
+
+    data["grid_import_kw"] = data["grid_net_kw"].clip(lower=0)
+    data["grid_export_kw"] = (-data["grid_net_kw"]).clip(lower=0)
+
+    data["offtake_cost_eur"] = (
+        data["grid_import_kw"]
+        * data["offtake_price_eur_per_mwh"]
+        * HOURS_PER_STEP
+        / 1000
+    )
+
+    data["injection_revenue_eur"] = (
+        data["grid_export_kw"]
+        * data["injection_price_eur_per_mwh"]
+        * HOURS_PER_STEP
+        / 1000
+    )
+
+    monthly = data.groupby(data.index.to_period("M")).agg(
+        energy_offtake_cost_eur=("offtake_cost_eur", "sum"),
+        injection_revenue_eur=("injection_revenue_eur", "sum"),
+        peak_offtake_kw=("grid_import_kw", "max"),
+    )
+
+    monthly["peak_cost_eur"] = (
+        monthly["peak_offtake_kw"] * OFFTAKE_PEAK_COST_EUR_PER_KW
+    )
+
+    monthly["total_bill_eur"] = (
+        monthly["energy_offtake_cost_eur"]
+        - monthly["injection_revenue_eur"]
+        + monthly["peak_cost_eur"]
+    )
+
+    return monthly
 
 def load_data(path: Path) -> pd.DataFrame:
     df = pd.read_csv(
@@ -33,6 +89,8 @@ def print_summary(df: pd.DataFrame) -> None:
     print(f"Peak PV:         {df['pv_production_kw'].max():.1f} kW")
     print(f"Peak net import: {df['grid_net_kw'].max():.1f} kW")
     print(f"Peak injection:  {-df['grid_net_kw'].min():.1f} kW")
+    print(f"Total offtake: {df['grid_net_kw'].clip(lower=0).sum()* HOURS_PER_STEP:.1f} kWh")
+    print(f"Total injection:  {(-df['grid_net_kw']).clip(lower=0).sum()* HOURS_PER_STEP:.1f} kWh")
     print()
     print(
         f"Offtake price range: "
@@ -151,6 +209,24 @@ def main() -> None:
     df = load_data(DATA_PATH)
 
     print_summary(df)
+
+    monthly_bills = calculate_monthly_bills(df)
+
+    print("\nMonthly bill without battery:")
+    print(
+        monthly_bills[
+            [
+                "energy_offtake_cost_eur",
+                "injection_revenue_eur",
+                "peak_offtake_kw",
+                "peak_cost_eur",
+                "total_bill_eur",
+            ]
+        ].round(2)
+    )
+
+    plot_monthly_bill(monthly_bills)
+
     plot_example_week(df)
     plot_daily_profile(df)
     plot_prices(df)

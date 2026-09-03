@@ -188,7 +188,7 @@ class Optimizer:
 
     MAX_HORIZON = 132
     DEFAULT_PEAK_SAFETY_MARGIN_KW = 20.0
-    DEFAULT_PEAK_SAFETY_PENALTY_EUR_PER_KW = 0.0
+    DEFAULT_PEAK_SAFETY_PENALTY_EUR_PER_KW = 100.0
 
     def __init__(
         self,
@@ -243,6 +243,9 @@ class Optimizer:
         model.current_month_step = pyo.Param(
             model.steps, mutable=True, within=pyo.Binary, initialize=0
         )
+        model.active_step = pyo.Param(
+            model.steps, mutable=True, within=pyo.Binary, initialize=0
+        )
         model.initial_energy = pyo.Param(mutable=True, initialize=0.0)
         model.past_month_peak = pyo.Param(mutable=True, initialize=0.0)
         model.charge = pyo.Var(
@@ -261,7 +264,8 @@ class Optimizer:
             model.steps, bounds=(0.0, self.specs.injection_limit_kw)
         )
         model.planned_peak = pyo.Var(bounds=(0.0, self.specs.offtake_limit_kw))
-        model.safety_peak_excess = pyo.Var(
+        model.safety_excess = pyo.Var(
+            model.steps,
             bounds=(0.0, self.peak_safety_margin_kw)
         )
 
@@ -292,10 +296,11 @@ class Optimizer:
             self.specs.offtake_limit_kw - self.peak_safety_margin_kw
         )
         model.safety_peak_limit = pyo.Constraint(
-            expr=(
-                model.safety_peak_excess
-                >= model.grid_import[0] - safe_import_limit_kw
-            )
+            model.steps,
+            rule=lambda m, step: m.safety_excess[step]
+            >= m.grid_import[step]
+            - safe_import_limit_kw
+            - self.specs.offtake_limit_kw * (1 - m.active_step[step]),
         )
         if negative_steps:
             model.negative_steps = pyo.Set(initialize=negative_steps)
@@ -343,7 +348,7 @@ class Optimizer:
         model.peak_safety_cost = pyo.Expression(
             expr=(
                 self.peak_safety_penalty_eur_per_kw
-                * model.safety_peak_excess
+                * sum(model.safety_excess[step] for step in model.steps)
             )
         )
         model.objective = pyo.Objective(
@@ -427,10 +432,12 @@ class Optimizer:
             model.offtake_price[step] = 0.0
             model.injection_price[step] = 0.0
             model.current_month_step[step] = 0
+            model.active_step[step] = 0
         for step in range(len(forecast)):
             model.net_kw[step] = net[step]
             model.offtake_price[step] = offtake_price[step]
             model.injection_price[step] = injection_price[step]
+            model.active_step[step] = 1
             timestamp = forecast.index[step]
             model.current_month_step[step] = int(
                 timestamp.year == context.at_time.year
@@ -454,8 +461,12 @@ class Optimizer:
         safe_import_limit_kw = (
             self.specs.offtake_limit_kw - self.peak_safety_margin_kw
         )
-        safety_peak_excess_kw = max(
-            0.0, float(pyo.value(model.grid_import[0])) - safe_import_limit_kw
+        safety_peak_excess_kw = sum(
+            max(
+                0.0,
+                float(pyo.value(model.grid_import[step])) - safe_import_limit_kw,
+            )
+            for step in active_steps
         )
 
         self.last_summary = {

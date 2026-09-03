@@ -219,7 +219,7 @@ def test_next_month_import_does_not_increase_current_month_peak(
         },
         index=index,
     )
-    optimizer = Optimizer(specs)
+    optimizer = Optimizer(specs, peak_safety_penalty_eur_per_kw=0.0)
 
     optimizer.solve(
         forecast,
@@ -244,7 +244,7 @@ def test_peak_safety_has_no_penalty_below_safe_import(specs: SiteSpecs) -> None:
     assert optimizer.last_summary["modeled_peak_safety_cost_eur"] == pytest.approx(0.0)
 
 
-def test_peak_safety_penalty_applies_only_to_committed_step(specs: SiteSpecs) -> None:
+def test_peak_safety_penalty_sums_horizon_excess(specs: SiteSpecs) -> None:
     battery = dataclasses.replace(specs.battery, discharge_power_kw=0.0)
     limited_specs = dataclasses.replace(specs, battery=battery)
     forecast, prices = _inputs([90.0, 95.0], [0.0, 0.0])
@@ -258,20 +258,8 @@ def test_peak_safety_penalty_applies_only_to_committed_step(specs: SiteSpecs) ->
         forecast, prices, _context(forecast.index, battery.max_soc)
     )
 
-    assert optimizer.last_summary["safety_peak_excess_kw"] == pytest.approx(10.0)
-    assert optimizer.last_summary["modeled_peak_safety_cost_eur"] == pytest.approx(100.0)
-
-
-def test_peak_safety_penalty_defaults_to_zero(specs: SiteSpecs) -> None:
-    forecast, prices = _inputs([70.0, 80.0], [0.0, 100_000.0])
-    context = _context(forecast.index, specs.battery.min_soc)
-
-    default_schedule = Optimizer(specs).solve(forecast, prices, context)
-    zero_penalty_schedule = Optimizer(
-        specs, peak_safety_penalty_eur_per_kw=0.0
-    ).solve(forecast, prices, context)
-
-    pd.testing.assert_frame_equal(default_schedule, zero_penalty_schedule)
+    assert optimizer.last_summary["safety_peak_excess_kw"] == pytest.approx(25.0)
+    assert optimizer.last_summary["modeled_peak_safety_cost_eur"] == pytest.approx(250.0)
 
 
 def test_peak_safety_penalty_keeps_unavoidable_high_load_feasible(
@@ -309,9 +297,7 @@ def test_valuable_dispatch_can_exceed_safe_import(specs: SiteSpecs) -> None:
     )
 
     assert first_import > 80.0
-    assert optimizer.last_summary["safety_peak_excess_kw"] == pytest.approx(
-        first_import - 80.0
-    )
+    assert optimizer.last_summary["safety_peak_excess_kw"] >= first_import - 80.0
 
 
 def test_unpublished_prices_are_not_invented(specs: SiteSpecs) -> None:
