@@ -425,7 +425,6 @@ class Optimizer:
                 pyo.value(model.incremental_peak_cost)
             ),
             "past_month_peak_kw": past_month_peak,
-            "planned_peak_kw": planned_peak,
             "initial_soc": float(context.initial_soc),
             "final_soc": float(energy[-1] / battery.capacity_kwh),
             "published_price_steps": published_price_steps,
