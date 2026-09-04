@@ -211,11 +211,15 @@ def _plot_dashboard(
 
     metrics, data = calculate_dashboard_metrics(schedule, summary)
 
+    # Average quoted prices over the reporting period.
+    avg_offtake_price = data["offtake_price_eur_per_mwh"].mean()
+    avg_injection_price = data["injection_price_eur_per_mwh"].mean()
+
     fig = plt.figure(figsize=(16, 13))
     grid = fig.add_gridspec(
         4,
         2,
-        height_ratios=(1.2, 2, 2, 2),
+        height_ratios=(1.3, 2, 2, 2),
         width_ratios=(0.85, 1.15),
     )
 
@@ -227,14 +231,22 @@ def _plot_dashboard(
     ops = [fig.add_subplot(ops_grid[i]) for i in range(4)]
 
     # ------------------------------------------------------------------
-    # KPI cards
+    # KPI table
     # ------------------------------------------------------------------
     cards.axis("off")
+    cards.set_xlim(0, 5)
+    cards.set_ylim(0, 2)
 
     items = [
         ("Savings", _display(metrics["total_savings_eur"], "EUR")),
-        ("Bill without", _display(metrics["bill_without_bess_eur"], "EUR")),
-        ("Bill with", _display(metrics["bill_with_bess_eur"], "EUR")),
+        (
+            "Bill without BESS",
+            _display(metrics["bill_without_bess_eur"], "EUR"),
+        ),
+        (
+            "Bill with BESS",
+            _display(metrics["bill_with_bess_eur"], "EUR"),
+        ),
         ("Load", _display(metrics["total_load_mwh"], "MWh")),
         ("PV", _display(metrics["pv_production_mwh"], "MWh")),
         (
@@ -245,26 +257,76 @@ def _plot_dashboard(
             "Grid injection",
             _display(metrics["grid_injection_with_bess_mwh"], "MWh"),
         ),
-        ("Cycles", _display(metrics["equivalent_full_cycles"])),
+        (
+            "Cycles",
+            _display(metrics["equivalent_full_cycles"]),
+        ),
+        (
+            "Avg. offtake price",
+            _display(avg_offtake_price, "EUR/MWh"),
+        ),
+        (
+            "Avg. injection price",
+            _display(avg_injection_price, "EUR/MWh"),
+        ),
     ]
 
-    for i, (label, text) in enumerate(items):
-        x = (i % 5) / 5 + 0.01
-        y = 0.85 - (i // 5) * 0.45
-        cards.text(x, y, f"{label}\n{text}", va="top")
+    # Light table separators.
+    for x in range(1, 5):
+        cards.plot(
+            [x, x],
+            [0.08, 1.92],
+            color="0.82",
+            lw=0.8,
+        )
 
-    # Bill composition belongs with the "Bill with" KPI rather than
-    # floating separately across the dashboard.
+    cards.plot(
+        [0.05, 4.95],
+        [1, 1],
+        color="0.82",
+        lw=0.8,
+    )
+
+    # KPI text.
+    for i, (label, text) in enumerate(items):
+        col = i % 5
+        row = 1 - i // 5
+
+        x = col + 0.5
+        y = row + 0.5
+
+        cards.text(
+            x,
+            y + 0.16,
+            label,
+            ha="center",
+            va="center",
+            fontsize=11,
+        )
+
+        cards.text(
+            x,
+            y - 0.05,
+            text,
+            ha="center",
+            va="center",
+            fontsize=14,
+            fontweight="bold",
+        )
+
+    # Small bill composition note inside the "Bill with" cell.
     cards.text(
-        0.41,
-        0.58,
+        2.5,
+        1.15,
         (
-            f"Energy {_display(metrics['energy_cost_with_bess_eur'], 'EUR')}\n"
-            f"Peak {_display(metrics['peak_cost_with_bess_eur'], 'EUR')} · "
+            f"Energy {_display(metrics['energy_cost_with_bess_eur'], 'EUR')}  ·  "
+            f"Peak {_display(metrics['peak_cost_with_bess_eur'], 'EUR')}  ·  "
             f"Cycling {_display(metrics['battery_cycling_cost_eur'], 'EUR')}"
         ),
-        va="top",
-        fontsize=8,
+        ha="center",
+        va="center",
+        fontsize=7.5,
+        color="0.35",
     )
 
     # ------------------------------------------------------------------
@@ -297,11 +359,15 @@ def _plot_dashboard(
     value.bar(
         ["Energy", "Peak", "Cycling"],
         values,
-        color=["#2a9d8f" if x >= 0 else "#e76f51" for x in values],
+        color=[
+            "#2a9d8f" if x >= 0 else "#e76f51"
+            for x in values
+        ],
     )
     value.axhline(0, color="black", lw=0.8)
     value.set_title(
-        f"Value decomposition: {metrics['total_savings_eur']:.1f} EUR"
+        f"Value decomposition: "
+        f"{metrics['total_savings_eur']:.1f} EUR"
     )
 
     # ------------------------------------------------------------------
@@ -325,7 +391,7 @@ def _plot_dashboard(
             ax.set_axis_off()
 
     else:
-        # 1. Site vs meter
+        # Site vs meter.
         ops[0].plot(
             last.index,
             last["realized_net_no_bess_kw"],
@@ -336,34 +402,38 @@ def _plot_dashboard(
             last["grid_net_with_bess_kw"],
             label="meter",
         )
-        ops[0].axhline(0, color="black", lw=0.6, alpha=0.5)
+        ops[0].axhline(
+            0,
+            color="black",
+            lw=0.6,
+            alpha=0.5,
+        )
         ops[0].set_ylabel("kW")
         ops[0].legend(fontsize=8)
         ops[0].set_title("Last complete day")
 
-        # 2. Prices
+        # Prices.
         ops[1].plot(
             last.index,
             last["offtake_price_eur_per_mwh"],
-            label="offtake",
+            label="offtake price",
         )
         ops[1].plot(
             last.index,
             last["injection_price_eur_per_mwh"],
-            label="injection",
+            label="injection price",
         )
         ops[1].set_ylabel("EUR/MWh")
         ops[1].legend(fontsize=8)
         ops[1].grid(alpha=0.15)
 
-        # 3. Battery power
-        # Positive = charging, negative = discharging.
+        # Battery power:
+        # positive = charging, negative = discharging.
         battery_power_kw = (
             last["applied_charge_kw"]
             - last["applied_discharge_kw"]
         )
 
-        # 15-minute bars, slightly narrower than the interval.
         bar_width_days = 12 / (24 * 60)
 
         ops[2].bar(
@@ -373,7 +443,6 @@ def _plot_dashboard(
             label="battery power",
         )
 
-        # Site-specific BESS power limits.
         charge_limit_kw = 200
         discharge_limit_kw = 200
 
@@ -389,15 +458,28 @@ def _plot_dashboard(
             linewidth=0.9,
             label="discharge limit",
         )
-        ops[2].axhline(0, color="black", lw=0.6)
+        ops[2].axhline(
+            0,
+            color="black",
+            lw=0.6,
+        )
         ops[2].set_ylabel("kW")
-        ops[2].legend(fontsize=8, ncol=2)
-        ops[2].grid(axis="y", alpha=0.15)
+        ops[2].legend(
+            fontsize=8,
+            ncol=2,
+        )
+        ops[2].grid(
+            axis="y",
+            alpha=0.15,
+        )
 
-        # 4. State of charge
+        # State of charge.
         soc_pct = 100 * last["soc"]
 
-        ops[3].plot(last.index, soc_pct)
+        ops[3].plot(
+            last.index,
+            soc_pct,
+        )
         ops[3].axhline(
             5,
             linestyle="--",
@@ -415,7 +497,6 @@ def _plot_dashboard(
         ops[3].legend(fontsize=8)
         ops[3].grid(alpha=0.15)
 
-        # Only show timestamps on the bottom operational plot.
         for ax in ops[:-1]:
             ax.tick_params(labelbottom=False)
 
