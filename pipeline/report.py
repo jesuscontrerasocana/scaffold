@@ -97,7 +97,6 @@ def calculate_dashboard_metrics(
     pv = float(pd.to_numeric(data["pv_production_kw"]).sum()) * HOURS_PER_STEP / 1000 if "pv_production_kw" in data else None
     metrics = {
         "total_savings_eur": savings,
-        "savings_rate_pct": None if bill_without == 0 else 100 * savings / bill_without,
         "bill_without_bess_eur": bill_without, "bill_with_bess_eur": bill_with,
         "total_load_mwh": load, "pv_production_mwh": pv,
         "grid_offtake_with_bess_mwh": float(data["grid_import_with_bess_kw"].sum()) * HOURS_PER_STEP / 1000,
@@ -200,33 +199,234 @@ def _display(value: float | None, unit: str = "") -> str:
     return "N/A" if value is None else f"{value:,.1f} {unit}".strip()
 
 
-def _plot_dashboard(schedule: pd.DataFrame, summary: dict[str, Any], path: Path) -> None:
+def _plot_dashboard(
+    schedule: pd.DataFrame,
+    summary: dict[str, Any],
+    path: Path,
+) -> None:
     try:
         plt = _plt()
     except ImportError:
         return
-    metrics, data = calculate_dashboard_metrics(schedule, summary)
-    fig = plt.figure(figsize=(16, 13)); grid = fig.add_gridspec(4, 2, height_ratios=(1.2, 2, 2, 2))
-    cards = fig.add_subplot(grid[0, :]); cumulative = fig.add_subplot(grid[1, :]); value = fig.add_subplot(grid[2:, 0])
-    ops_grid = grid[2:, 1].subgridspec(3, 1); ops = [fig.add_subplot(ops_grid[i]) for i in range(3)]
-    cards.axis("off")
-    items = [("Savings", _display(metrics["total_savings_eur"], "EUR")), ("Savings rate", _display(metrics["savings_rate_pct"], "%")), ("Bill without", _display(metrics["bill_without_bess_eur"], "EUR")), ("Bill with", _display(metrics["bill_with_bess_eur"], "EUR")), ("Load", _display(metrics["total_load_mwh"], "MWh")), ("PV", _display(metrics["pv_production_mwh"], "MWh")), ("Grid offtake", _display(metrics["grid_offtake_with_bess_mwh"], "MWh")), ("Grid injection", _display(metrics["grid_injection_with_bess_mwh"], "MWh")), ("Cycles", _display(metrics["equivalent_full_cycles"]))]
-    for i, (label, text) in enumerate(items):
-        cards.text((i % 5) / 5 + .01, .85 - (i // 5) * .45, f"{label}\n{text}", va="top")
-    cards.text(.61, .12, f"Bill: energy {_display(metrics['energy_cost_with_bess_eur'], 'EUR')} | peak {_display(metrics['peak_cost_with_bess_eur'], 'EUR')} | cycling {_display(metrics['battery_cycling_cost_eur'], 'EUR')}")
-    cumulative.plot(data.index, data["cumulative_bill_without_bess_eur"], label="without BESS"); cumulative.plot(data.index, data["cumulative_bill_with_bess_eur"], label="with BESS"); cumulative.set_title("Cumulative bill"); cumulative.set_ylabel("EUR"); cumulative.legend(); cumulative.grid(alpha=.2)
-    values = [metrics["energy_cost_value_eur"], metrics["peak_cost_value_eur"], metrics["cycling_cost_value_eur"]]
-    value.bar(["Energy", "Peak", "Cycling"], values, color=["#2a9d8f" if x >= 0 else "#e76f51" for x in values]); value.axhline(0, color="black", lw=.8); value.set_title(f"Value decomposition: {metrics['total_savings_eur']:.1f} EUR")
-    days = [group for _, group in data.groupby(data.index.normalize()) if len(group) == 96]
-    last = days[-1] if days else data.iloc[0:0]
-    if last.empty:
-        for ax in ops: ax.text(.5, .5, "No complete day available", ha="center"); ax.set_axis_off()
-    else:
-        ops[0].plot(last.index, last["realized_net_no_bess_kw"], label="site net"); ops[0].plot(last.index, last["grid_net_with_bess_kw"], label="meter"); ops[0].legend(fontsize=8); ops[0].set_title("Last complete day")
-        ops[1].plot(last.index, last["applied_charge_kw"], label="charge"); ops[1].plot(last.index, -last["applied_discharge_kw"], label="discharge"); ops[1].legend(fontsize=8)
-        ops[2].plot(last.index, 100 * last["soc"]); ops[2].set_ylabel("SoC (%)"); ops[2].set_ylim(0, 100)
-    fig.suptitle("Monthly BESS performance dashboard", fontsize=16); fig.tight_layout(); fig.savefig(path, dpi=120); plt.close(fig)
 
+    metrics, data = calculate_dashboard_metrics(schedule, summary)
+
+    fig = plt.figure(figsize=(16, 13))
+    grid = fig.add_gridspec(
+        4,
+        2,
+        height_ratios=(1.2, 2, 2, 2),
+        width_ratios=(0.85, 1.15),
+    )
+
+    cards = fig.add_subplot(grid[0, :])
+    cumulative = fig.add_subplot(grid[1, :])
+    value = fig.add_subplot(grid[2:, 0])
+
+    ops_grid = grid[2:, 1].subgridspec(4, 1, hspace=0.15)
+    ops = [fig.add_subplot(ops_grid[i]) for i in range(4)]
+
+    # ------------------------------------------------------------------
+    # KPI cards
+    # ------------------------------------------------------------------
+    cards.axis("off")
+
+    items = [
+        ("Savings", _display(metrics["total_savings_eur"], "EUR")),
+        ("Bill without", _display(metrics["bill_without_bess_eur"], "EUR")),
+        ("Bill with", _display(metrics["bill_with_bess_eur"], "EUR")),
+        ("Load", _display(metrics["total_load_mwh"], "MWh")),
+        ("PV", _display(metrics["pv_production_mwh"], "MWh")),
+        (
+            "Grid offtake",
+            _display(metrics["grid_offtake_with_bess_mwh"], "MWh"),
+        ),
+        (
+            "Grid injection",
+            _display(metrics["grid_injection_with_bess_mwh"], "MWh"),
+        ),
+        ("Cycles", _display(metrics["equivalent_full_cycles"])),
+    ]
+
+    for i, (label, text) in enumerate(items):
+        x = (i % 5) / 5 + 0.01
+        y = 0.85 - (i // 5) * 0.45
+        cards.text(x, y, f"{label}\n{text}", va="top")
+
+    # Bill composition belongs with the "Bill with" KPI rather than
+    # floating separately across the dashboard.
+    cards.text(
+        0.41,
+        0.58,
+        (
+            f"Energy {_display(metrics['energy_cost_with_bess_eur'], 'EUR')}\n"
+            f"Peak {_display(metrics['peak_cost_with_bess_eur'], 'EUR')} · "
+            f"Cycling {_display(metrics['battery_cycling_cost_eur'], 'EUR')}"
+        ),
+        va="top",
+        fontsize=8,
+    )
+
+    # ------------------------------------------------------------------
+    # Cumulative bill
+    # ------------------------------------------------------------------
+    cumulative.plot(
+        data.index,
+        data["cumulative_bill_without_bess_eur"],
+        label="without BESS",
+    )
+    cumulative.plot(
+        data.index,
+        data["cumulative_bill_with_bess_eur"],
+        label="with BESS",
+    )
+    cumulative.set_title("Cumulative bill")
+    cumulative.set_ylabel("EUR")
+    cumulative.legend()
+    cumulative.grid(alpha=0.2)
+
+    # ------------------------------------------------------------------
+    # Value decomposition
+    # ------------------------------------------------------------------
+    values = [
+        metrics["energy_cost_value_eur"],
+        metrics["peak_cost_value_eur"],
+        metrics["cycling_cost_value_eur"],
+    ]
+
+    value.bar(
+        ["Energy", "Peak", "Cycling"],
+        values,
+        color=["#2a9d8f" if x >= 0 else "#e76f51" for x in values],
+    )
+    value.axhline(0, color="black", lw=0.8)
+    value.set_title(
+        f"Value decomposition: {metrics['total_savings_eur']:.1f} EUR"
+    )
+
+    # ------------------------------------------------------------------
+    # Last complete day
+    # ------------------------------------------------------------------
+    days = [
+        group
+        for _, group in data.groupby(data.index.normalize())
+        if len(group) == 96
+    ]
+    last = days[-1] if days else data.iloc[0:0]
+
+    if last.empty:
+        for ax in ops:
+            ax.text(
+                0.5,
+                0.5,
+                "No complete day available",
+                ha="center",
+            )
+            ax.set_axis_off()
+
+    else:
+        # 1. Site vs meter
+        ops[0].plot(
+            last.index,
+            last["realized_net_no_bess_kw"],
+            label="site net",
+        )
+        ops[0].plot(
+            last.index,
+            last["grid_net_with_bess_kw"],
+            label="meter",
+        )
+        ops[0].axhline(0, color="black", lw=0.6, alpha=0.5)
+        ops[0].set_ylabel("kW")
+        ops[0].legend(fontsize=8)
+        ops[0].set_title("Last complete day")
+
+        # 2. Prices
+        ops[1].plot(
+            last.index,
+            last["offtake_price_eur_per_mwh"],
+            label="offtake",
+        )
+        ops[1].plot(
+            last.index,
+            last["injection_price_eur_per_mwh"],
+            label="injection",
+        )
+        ops[1].set_ylabel("EUR/MWh")
+        ops[1].legend(fontsize=8)
+        ops[1].grid(alpha=0.15)
+
+        # 3. Battery power
+        # Positive = charging, negative = discharging.
+        battery_power_kw = (
+            last["applied_charge_kw"]
+            - last["applied_discharge_kw"]
+        )
+
+        # 15-minute bars, slightly narrower than the interval.
+        bar_width_days = 12 / (24 * 60)
+
+        ops[2].bar(
+            last.index,
+            battery_power_kw,
+            width=bar_width_days,
+            label="battery power",
+        )
+
+        # Site-specific BESS power limits.
+        charge_limit_kw = 200
+        discharge_limit_kw = 200
+
+        ops[2].axhline(
+            charge_limit_kw,
+            linestyle="--",
+            linewidth=0.9,
+            label="charge limit",
+        )
+        ops[2].axhline(
+            -discharge_limit_kw,
+            linestyle="--",
+            linewidth=0.9,
+            label="discharge limit",
+        )
+        ops[2].axhline(0, color="black", lw=0.6)
+        ops[2].set_ylabel("kW")
+        ops[2].legend(fontsize=8, ncol=2)
+        ops[2].grid(axis="y", alpha=0.15)
+
+        # 4. State of charge
+        soc_pct = 100 * last["soc"]
+
+        ops[3].plot(last.index, soc_pct)
+        ops[3].axhline(
+            5,
+            linestyle="--",
+            linewidth=0.9,
+            label="min SoC",
+        )
+        ops[3].axhline(
+            95,
+            linestyle="--",
+            linewidth=0.9,
+            label="max SoC",
+        )
+        ops[3].set_ylabel("SoC (%)")
+        ops[3].set_ylim(0, 100)
+        ops[3].legend(fontsize=8)
+        ops[3].grid(alpha=0.15)
+
+        # Only show timestamps on the bottom operational plot.
+        for ax in ops[:-1]:
+            ax.tick_params(labelbottom=False)
+
+    fig.suptitle(
+        "Monthly BESS performance dashboard",
+        fontsize=16,
+    )
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(); parser.add_argument("--schedule", type=Path, required=True); parser.add_argument("--summary", type=Path); parser.add_argument("--log", type=Path); parser.add_argument("--out", type=Path)
