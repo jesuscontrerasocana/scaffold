@@ -191,7 +191,7 @@ class Optimizer:
     def __init__(
         self,
         specs: SiteSpecs,
-        enforce_negative_price_exclusivity: bool = False,
+        enforce_negative_price_exclusivity: bool = True,
     ) -> None:
         self.specs = specs
         self.enforce_negative_price_exclusivity = (
